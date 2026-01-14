@@ -499,6 +499,14 @@ void handleCommand() {
           n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
           bool ok = LoraLink::scheduleSend(ll, out, n);
           drawDebug(out, n);
+          if (ok) {
+            if (LoraLink::isBroadcast3(recv3)) {
+              // CONFIG should be unicast, but if broadcast, allow longer RX window
+              LoraLink::requestRxTimed(ll, RX_WINDOW_BROADCAST_MS);
+            } else {
+              LoraLink::requestRxTimed(ll, RX_WINDOW_UNICAST_MS, 1);
+            }
+          }
         }
       } break;
 
@@ -517,6 +525,23 @@ void handleCommand() {
             syncState = SyncState::AUTO_ALLOWED;   // host sync done -> auto sync allowed again (30s gate applies)
           } else {
             syncState = SyncState::HOST_SYNC_RETRY;
+          }
+        }
+      } break;
+
+      case LoraProto::OPC_STREAM: {
+        if (bodyLen == sizeof(LoraProto::P_Stream)) {
+          LoraProto::P_Stream p{};
+          memcpy(&p, body, sizeof(p));
+          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
+          bool ok = LoraLink::scheduleSend(ll, out, n);
+          drawDebug(out, n);
+          if (ok) {
+            if (LoraLink::isBroadcast3(recv3)) {
+              LoraLink::requestRxTimed(ll, RX_WINDOW_BROADCAST_MS);
+            } else {
+              LoraLink::requestRxTimed(ll, RX_WINDOW_UNICAST_MS, 1);
+            }
           }
         }
       } break;

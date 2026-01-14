@@ -12,7 +12,7 @@ namespace LoraProto {
 
 // -------------------- Versioning --------------------
 static const uint8_t PROTO_VER_MAJOR = 1;
-static const uint8_t PROTO_VER_MINOR = 3;
+static const uint8_t PROTO_VER_MINOR = 4;
 
 // -------------------- Direction/Type helpers --------------------
 static const uint8_t DIR_M2N = 0x00;  // Master -> Node
@@ -40,6 +40,7 @@ enum Opcode7 : uint8_t {
   OPC_CONTROL       = 0x04, // CONTROL (M2N)
   OPC_CONFIG        = 0x05, // CONFIG (M2N)
   OPC_SYNC          = 0x06, // SYNC Pulse (M2N)
+  OPC_STREAM        = 0x07, // STREAM_M2N (M2N)
   OPC_ACK           = 0x7E, // ACK (both directions, as response only)
   // (optional future: 0x05 STATUS_UPDATE N2M unrequested telemetry)
 };
@@ -50,14 +51,15 @@ struct __attribute__((packed)) P_GetDevices  { uint8_t groupId; uint8_t flags;  
 struct __attribute__((packed)) P_SetGroup    { uint8_t groupId;                       }; // 1B
 struct __attribute__((packed)) P_GetStatus   { uint8_t groupId; uint8_t flags;        }; // 2B
 struct __attribute__((packed)) P_Control     { uint8_t groupId; uint8_t flags; uint8_t presetId; uint8_t brightness; }; // 4B // add palette later?
-struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t flags;         }; // 2B // no groupId needed as this packet is not allowed as broadcast anyway
+struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t data0; uint8_t data1; uint8_t data2; uint8_t data3; }; // 5B
 struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; uint8_t ts24_2; uint8_t brightness; }; // 4B // 24-bit timestamp LSB first + bri
+struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];         }; // 9B
 
 // Node -> Master
 //struct __attribute__((packed)) P_IdentifyReply { uint8_t proto_ver_major; uint8_t proto_ver_minor; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B
 struct __attribute__((packed)) P_IdentifyReply { uint8_t fw; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B // fw, caps, groupId, mac6[6] // 9B
 //struct __attribute__((packed)) P_StatusReply   { uint8_t fw_major; uint8_t fw_minor; uint8_t fw_patch; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 7B
-struct __attribute__((packed)) P_StatusReply   { uint8_t flags; uint8_t presetId; uint8_t brightness; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 7B
+struct __attribute__((packed)) P_StatusReply   { uint8_t flags; uint8_t configByte; uint8_t presetId; uint8_t brightness; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 8B
 
 // ACK (both directions, response only)
 enum AckStatus : uint8_t { ACK_OK=0, ACK_BAD_TYPE=1, ACK_BAD_LEN=2, ACK_UNAUTHORIZED=3, ACK_BUSY=4, ACK_ERROR=5 };
@@ -66,6 +68,7 @@ struct __attribute__((packed)) P_Ack { uint8_t echo_opcode7; uint8_t status; uin
 static_assert(sizeof(P_Control) <= BODY_MAX, "P_Control too large");
 static_assert(sizeof(P_Config) <= BODY_MAX, "P_Config too large");
 static_assert(sizeof(P_Sync) <= BODY_MAX, "P_Sync too large");
+static_assert(sizeof(P_Stream) <= BODY_MAX, "P_Stream too large");
 static_assert(sizeof(P_IdentifyReply) <= BODY_MAX, "P_IdentifyReply too large");
 static_assert(sizeof(P_StatusReply) <= BODY_MAX, "P_StatusReply too large");
 static_assert(sizeof(P_Ack) <= BODY_MAX, "P_Ack too large");
@@ -92,14 +95,16 @@ static constexpr PacketRule RULES[] = {
   { OPC_DEVICES,    DIR_M2N, RESP_SPECIFIC, OPC_DEVICES, SZ<P_GetDevices>(),  SZ<P_IdentifyReply>(), "DEVICES/IDENTIFY" },
   // SET_GROUP (M2N, 1B) -> ACK
   { OPC_SET_GROUP,  DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_SetGroup>(),    SZ<P_Ack>(),           "SET_GROUP" },
-  // OPC_STATUS: GET_STATUS (M2N, 2B) -> STATUS_REPLY (N2M, 7B)
+  // OPC_STATUS: GET_STATUS (M2N, 2B) -> STATUS_REPLY (N2M, 8B)
   { OPC_STATUS,     DIR_M2N, RESP_SPECIFIC, OPC_STATUS,  SZ<P_GetStatus>(),   SZ<P_StatusReply>(),   "STATUS" },
   // OPC_CONTROL: CONTROL (M2N, 4B) -> no response
   { OPC_CONTROL,    DIR_M2N, RESP_NONE,     0,           SZ<P_Control>(),     0,                     "CONTROL" },
-  // CONFIG (M2N, 2B) -> ACK
+  // CONFIG (M2N, 5B) -> ACK
   { OPC_CONFIG,     DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_Config>(),      SZ<P_Ack>(),           "CONFIG" },
-  // OPC_SYNC: SYNC (M2N, 3B) -> no response
+  // OPC_SYNC: SYNC (M2N, 4B) -> no response
   { OPC_SYNC,       DIR_M2N, RESP_NONE,     0,           SZ<P_Sync>(),        0,                     "SYNC" },
+  // OPC_STREAM: STREAM_M2N (M2N, 9B) -> ACK (only last packet in stream)
+  { OPC_STREAM,     DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_Stream>(),      SZ<P_Ack>(),           "STREAM_M2N" },
 };
 
 // Lookup by 7-bit opcode
