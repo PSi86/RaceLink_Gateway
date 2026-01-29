@@ -225,6 +225,9 @@ inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]
   return isBroadcast3(receiver3) || same3(receiver3, myLast3);
 }
 
+// Forward declaration (stream helpers use scheduleSend).
+inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500);
+
 // -------------------- Stream helpers --------------------
 enum class StreamStatus : uint8_t { StreamStart, StreamContinue, StreamEnd, Error };
 
