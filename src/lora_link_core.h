@@ -225,6 +225,24 @@ inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]
   return isBroadcast3(receiver3) || same3(receiver3, myLast3);
 }
 
+// Maximaler LBT-Backoff in Millisekunden basierend auf time-on-air für das längste Paket
+// (für 17-Byte-Paket ca. 51 ms bei SF7BW125CR45)
+inline uint16_t lbtBackoffMaxMs(const Core& ll) {
+  uint32_t ms = ll.toaUsMax17 / 1000U;   // floor(ToA/1000)
+  return (ms < 5U) ? 5U : (uint16_t)ms;  // mind. 5 ms
+}
+
+// RadioLib RNG: random(minMs, maxMs). Inklusive oberer Rand => maxMs+1
+inline uint16_t randMs(Core& ll, uint16_t minMs, uint16_t maxMs) {
+  if (maxMs <= minMs) return minMs;
+  const int32_t lo = (int32_t)minMs;
+  const int32_t hiExclusive = (int32_t)maxMs + 1;
+  int32_t r = ll.radio
+                ? ll.radio->random(lo, hiExclusive)      // PhysicalLayer::random
+                : (int32_t)::random((long)lo, (long)hiExclusive);
+  return (uint16_t)r;
+}
+
 // -------------------- RX/TX mode helpers --------------------
 inline void setDefaultIdle(Core& ll) {
   ll.defaultRxKind = RxKind::None;
@@ -470,24 +488,6 @@ inline void attachDio1(LLCC68& radio, Core& ll) {
 #else
 #error "No LoRa radio module defined"
 #endif
-
-// Maximaler LBT-Backoff in Millisekunden basierend auf time-on-air für das längste Paket
-// (für 17-Byte-Paket ca. 51 ms bei SF7BW125CR45)
-inline uint16_t lbtBackoffMaxMs(const Core& ll) {
-  uint32_t ms = ll.toaUsMax17 / 1000U;   // floor(ToA/1000)
-  return (ms < 5U) ? 5U : (uint16_t)ms;  // mind. 5 ms
-}
-
-// RadioLib RNG: random(minMs, maxMs). Inklusive oberer Rand => maxMs+1
-inline uint16_t randMs(Core& ll, uint16_t minMs, uint16_t maxMs) {
-  if (maxMs <= minMs) return minMs;
-  const int32_t lo = (int32_t)minMs;
-  const int32_t hiExclusive = (int32_t)maxMs + 1;
-  int32_t r = ll.radio
-                ? ll.radio->random(lo, hiExclusive)      // PhysicalLayer::random
-                : (int32_t)::random((long)lo, (long)hiExclusive);
-  return (uint16_t)r;
-}
 
 // -------------------- The service pump (call in loop()) --------------------
 inline void service(Core& ll, const Callbacks& cb) {
