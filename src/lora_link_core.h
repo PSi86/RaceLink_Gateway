@@ -133,6 +133,14 @@ struct Core {
   uint16_t  txCount       = 0;
   uint32_t  lastTxAtMs    = 0;
 
+  // --- Stream RX buffer (max 16 packets * 8 bytes = 128 bytes) ---
+  bool      streamActive         = false;
+  bool      streamReady          = false;
+  uint8_t   streamBuf[128]       = {0};
+  uint8_t   streamLen            = 0;
+  uint8_t   streamOffset         = 0;
+  uint8_t   streamLastPacketsLeft = 0;
+
   // --- LBT / Arbiter / ToA ---
   bool       lbtEnable   = true;                // im Setup setzen
   bool       lbtRxRelax  = true;              // LBT-Backoff (µs)
@@ -205,6 +213,63 @@ inline bool isBroadcast3(const uint8_t last3[3]) {
 
 inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]) {
   return isBroadcast3(receiver3) || same3(receiver3, myLast3);
+}
+
+// -------------------- Stream helpers --------------------
+enum class StreamStatus : uint8_t { StreamStart, StreamContinue, StreamEnd, Error };
+
+inline const uint8_t* streamBuffer(const Core& ll, uint8_t& len) {
+  len = ll.streamLen;
+  return ll.streamBuf;
+}
+
+inline void clearStreamReady(Core& ll) {
+  ll.streamReady = false;
+}
+
+inline StreamStatus handleStreamPacket(Core& ll, const LoraProto::P_Stream& pkt) {
+  constexpr uint8_t kStreamDataLen = sizeof(pkt.data);
+  constexpr uint8_t kMaxPackets = 16;
+  const LoraProto::StreamCtrl ctrl = LoraProto::decode_stream_ctrl(pkt.ctrl);
+
+  if (ctrl.packets_left >= kMaxPackets) return StreamStatus::Error;
+
+  if (ctrl.start) {
+    if (ctrl.stop || ctrl.packets_left == 0) return StreamStatus::Error;
+    ll.streamActive = true;
+    ll.streamReady = false;
+    ll.streamLen = 0;
+    ll.streamOffset = 0;
+    ll.streamLastPacketsLeft = ctrl.packets_left;
+    if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
+    memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
+    ll.streamOffset += kStreamDataLen;
+    ll.streamLen = ll.streamOffset;
+    return StreamStatus::StreamStart;
+  }
+
+  if (!ll.streamActive) return StreamStatus::Error;
+
+  if (ctrl.stop) {
+    if (ctrl.packets_left != 0 || ll.streamLastPacketsLeft != 1) return StreamStatus::Error;
+    if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
+    memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
+    ll.streamOffset += kStreamDataLen;
+    ll.streamLen = ll.streamOffset;
+    ll.streamActive = false;
+    ll.streamReady = true;
+    ll.streamLastPacketsLeft = 0;
+    return StreamStatus::StreamEnd;
+  }
+
+  if (ctrl.packets_left == 0) return StreamStatus::Error;
+  if (ctrl.packets_left != static_cast<uint8_t>(ll.streamLastPacketsLeft - 1)) return StreamStatus::Error;
+  if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
+  memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
+  ll.streamOffset += kStreamDataLen;
+  ll.streamLen = ll.streamOffset;
+  ll.streamLastPacketsLeft = ctrl.packets_left;
+  return StreamStatus::StreamContinue;
 }
 
 // -------------------- Radio initialization common code --------------------

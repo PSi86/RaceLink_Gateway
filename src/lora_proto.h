@@ -55,6 +55,20 @@ struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t data0; ui
 struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; uint8_t ts24_2; uint8_t brightness; }; // 4B // 24-bit timestamp LSB first + bri
 struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];         }; // 9B
 
+struct StreamCtrl {
+  bool start;
+  bool stop;
+  uint8_t packets_left;
+};
+
+inline StreamCtrl decode_stream_ctrl(uint8_t ctrl) {
+  StreamCtrl decoded{};
+  decoded.start = (ctrl & 0x80U) != 0U;
+  decoded.stop = (ctrl & 0x40U) != 0U;
+  decoded.packets_left = static_cast<uint8_t>(ctrl & 0x3FU);
+  return decoded;
+}
+
 // Node -> Master
 //struct __attribute__((packed)) P_IdentifyReply { uint8_t proto_ver_major; uint8_t proto_ver_minor; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B
 struct __attribute__((packed)) P_IdentifyReply { uint8_t fw; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B // fw, caps, groupId, mac6[6] // 9B
