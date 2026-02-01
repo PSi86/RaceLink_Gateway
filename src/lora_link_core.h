@@ -352,16 +352,17 @@ inline bool scheduleStreamSend(Core& ll, const uint8_t* data, uint8_t len,
   constexpr uint8_t kMaxLen = 16 * kChunkLen;
   if (ll.streamActive || ll.txPending || ll.streamMode != Core::StreamMode::None) return false;
   if (!data || len == 0 || len > kMaxLen) return false;
-  if ((len % kChunkLen) != 0) return false;
-  const uint8_t totalPackets = static_cast<uint8_t>(len / kChunkLen);
+  const uint8_t totalPackets = static_cast<uint8_t>((len + kChunkLen - 1U) / kChunkLen);
   if (totalPackets < 2 || totalPackets > 16) return false;
 
+  const uint8_t paddedLen = static_cast<uint8_t>(totalPackets * kChunkLen);
+  memset(ll.streamBuf, 0, paddedLen);
   memcpy(ll.streamBuf, data, len);
   ll.streamMode = Core::StreamMode::Tx;
   ll.streamActive = true;
   ll.streamReady = false;
   ll.streamLastScheduled = false;
-  ll.streamLen = len;
+  ll.streamLen = paddedLen;
   ll.streamOffset = 0;
   ll.streamTotalPackets = totalPackets;
   ll.streamIndex = 0;
