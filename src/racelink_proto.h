@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// LoRaProto v1.1 -- shared, header-only protocol for ESP32 + SX1262
+// RaceLink protocol v1.1 -- shared, header-only protocol for ESP32 + SX1262
 // Packet = Header7 (3B sender + 3B receiver + 1B type) + Body (0..20B)
 // Direction bit (0x80): 0 = Master->Node, 1 = Node->Master
 // Broadcast: receiver3 == FF:FF:FF
@@ -19,7 +19,7 @@ enum RL_Dev_Type : uint8_t {
   // Add more device types as needed
 };
 
-namespace LoraProto {
+namespace RaceLinkProto {
 
 // -------------------- Versioning --------------------
 static const uint8_t PROTO_VER_MAJOR = 1;
@@ -176,7 +176,7 @@ inline RespDecision decide_response(uint8_t in_type, uint8_t in_body_len) {
 
 // -------------------- Pack/Unpack helpers --------------------
 inline void put3(uint8_t dst[3], const uint8_t src[3]) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; }
-inline bool isBroadcast3(const uint8_t r3[3]) { return r3[0]==0xFF && r3[1]==0xFF && r3[2]==0xFF; } // TODO: auch weitere helper aus lora_link_core.h hierher oder alle helper nach lora_link_core.h verschieben?
+inline bool isBroadcast3(const uint8_t r3[3]) { return r3[0]==0xFF && r3[1]==0xFF && r3[2]==0xFF; } // TODO: auch weitere helper aus racelink_transport_core.h hierher oder alle helper nach racelink_transport_core.h verschieben?
 
 inline bool parseHeader(const uint8_t* buf, uint8_t len, Header7& h) {
   if (len < sizeof(Header7)) return false;
@@ -211,4 +211,4 @@ inline uint8_t build_empty(uint8_t* out, const uint8_t s3[3], const uint8_t r3[3
   return (uint8_t)sizeof(Header7);
 }
 
-} // namespace LoraProto
+} // namespace RaceLinkProto

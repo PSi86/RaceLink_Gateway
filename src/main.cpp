@@ -6,11 +6,11 @@
  */
 
 #include <Arduino.h>
-#include "lora_proto.h"
-#include "lora_link_core.h"
+#include "racelink_proto.h"
+#include "racelink_transport_core.h"
 
-static LoraLink::Core ll{};
-static LoraLink::Callbacks cb{};
+static RaceLinkTransport::Core rl{};
+static RaceLinkTransport::Callbacks cb{};
 
 #include <SPI.h>
 #include <Wire.h>
@@ -80,7 +80,7 @@ void IRAM_ATTR isr_button() { btnFallingFlag = true; }
 
 /************ USB framing for Host <-> Device (gc_transport.py) ************/
 // Frame: [0x00][LEN][TYPE][DATA...]; LEN = len(TYPE+DATA)
-// Device->Host LoRa forward: TYPE = Header7.type (N2M), DATA = [Header7][Body][RSSI(LE16)][SNR(i8)]
+// Device->Host RaceLink transport forward: TYPE = Header7.type (N2M), DATA = [Header7][Body][RSSI(LE16)][SNR(i8)]
 // Device->Host Events:
 static const uint8_t EV_ERROR            = 0xF0;
 static const uint8_t EV_RX_WINDOW_OPEN   = 0xF1; // DATA: window_ms (LE16)
@@ -112,7 +112,7 @@ static inline void usb_send_event_u16(uint8_t evType, uint16_t v) {
 U8G2_SSD1306_64X32_1F_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST);
 
 /************ MAC ************/
-// lora_link_core.h enthält jetzt die MAC-bezogenen Elemente (ll.myMac6, ll.myLast3, ll.macReadOK)
+// racelink_transport_core.h enthält jetzt die MAC-bezogenen Elemente (rl.myMac6, rl.myLast3, rl.macReadOK)
 /* uint8_t myMac6[6]  = {0};
 uint8_t myLast3[3] = {0};
 bool macReadOK = false;
@@ -210,17 +210,17 @@ void drawStatus() {
   if (inhibitStatusDraw) return;
 
   char lineTX[16], lineRX[16];
-  snprintf(lineTX, sizeof(lineTX), "TX:%u", ll.txCount);
-  snprintf(lineRX, sizeof(lineRX), "RX:%u", ll.rxCountFiltered);
+  snprintf(lineTX, sizeof(lineTX), "TX:%u", rl.txCount);
+  snprintf(lineRX, sizeof(lineRX), "RX:%u", rl.rxCountFiltered);
 
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_9x15_mf);     // ~15px Zeilenhöhe -> 2 Zeilen passen in 32px
 
   // y-Koordinaten sind Baselines
-  if (ll.rfMode == LoraLink::Mode::Tx) {
+  if (rl.rfMode == RaceLinkTransport::Mode::Tx) {
     drawStringBold(0, 14, lineTX);
     u8g2.drawStr(0, 31, lineRX);
-  } else if (ll.rfMode == LoraLink::Mode::Rx) {
+  } else if (rl.rfMode == RaceLinkTransport::Mode::Rx) {
     u8g2.drawStr(0, 14, lineTX);
     drawStringBold(0, 31, lineRX);
   } else {
@@ -302,60 +302,60 @@ static uint32_t      lastSyncQueuedMs = 0;   // when a sync was successfully que
 static uint8_t       hostSyncBri = 128;      // brightness of last host-triggered (pending) sync
 
 // Queue a frame for immediate TX without CAD/LBT and without jitter.
-static bool ll_queueTxNoCad(LoraLink::Core& ll, const uint8_t* buf, uint8_t len) {
+static bool rl_queueTxNoCad(RaceLinkTransport::Core& rl, const uint8_t* buf, uint8_t len) {
   if (!buf || !len) return false;
-  if (ll.txPending) return false;
+  if (rl.txPending) return false;
 
-  const bool prevLbt = ll.lbtEnable;
-  ll.lbtEnable = false;
-  const bool ok = LoraLink::scheduleSend(ll, buf, len, 0 /*no jitter*/);
-  ll.lbtEnable = prevLbt;
+  const bool prevLbt = rl.lbtEnable;
+  rl.lbtEnable = false;
+  const bool ok = RaceLinkTransport::scheduleSend(rl, buf, len, 0 /*no jitter*/);
+  rl.lbtEnable = prevLbt;
   return ok;
 }
 
 // Build + queue a global SYNC frame (broadcast) using the current millis()-based timebase.
-static bool sendSync(LoraLink::Core& ll, uint8_t brightness) {
+static bool sendSync(RaceLinkTransport::Core& rl, uint8_t brightness) {
   static const uint8_t BCAST3[3] = {0xFF, 0xFF, 0xFF};
 
   const uint32_t t = millis();
 
-  LoraProto::P_Sync p{};
+  RaceLinkProto::P_Sync p{};
   p.ts24_0 = (uint8_t)(t);
   p.ts24_1 = (uint8_t)(t >> 8);
   p.ts24_2 = (uint8_t)(t >> 16);
   p.brightness = brightness;
 
-  uint8_t out[sizeof(LoraProto::Header7) + sizeof(LoraProto::P_Sync)];
-  const uint8_t type_full = LoraProto::make_type(LoraProto::DIR_M2N, LoraProto::OPC_SYNC);
-  const uint8_t n = LoraProto::build(out, ll.myLast3, BCAST3, type_full, p);
+  uint8_t out[sizeof(RaceLinkProto::Header7) + sizeof(RaceLinkProto::P_Sync)];
+  const uint8_t type_full = RaceLinkProto::make_type(RaceLinkProto::DIR_M2N, RaceLinkProto::OPC_SYNC);
+  const uint8_t n = RaceLinkProto::build(out, rl.myLast3, BCAST3, type_full, p);
 
   // no CAD/LBT, no jitter
-  return ll_queueTxNoCad(ll, out, n);
+  return rl_queueTxNoCad(rl, out, n);
 }
 
 // Auto-SYNC should only be sent when nothing else is happening.
-static bool idleForAutoSync(const LoraLink::Core& ll) {
+static bool idleForAutoSync(const RaceLinkTransport::Core& rl) {
   // USB work pending?
   if (newSerialData) return false;
   if (Serial.available() > 0) return false;
 
   // Link busy?
-  if (ll.txPending) return false;
+  if (rl.txPending) return false;
 
   // Do not interfere with receive mode / rx windows
-  if (ll.rfMode != LoraLink::Mode::Idle) return false;
-  if (ll.reqRxKind != LoraLink::RxKind::None) return false;
+  if (rl.rfMode != RaceLinkTransport::Mode::Idle) return false;
+  if (rl.reqRxKind != RaceLinkTransport::RxKind::None) return false;
 
   return true;
 }
 
-static void sync_service(LoraLink::Core& ll) {
+static void sync_service(RaceLinkTransport::Core& rl) {
   const uint32_t now = millis();
 
   // 1) Host-triggered SYNC retry: send ASAP once TX becomes available.
   if (syncState == SyncState::HOST_SYNC_RETRY) {
-    if (!ll.txPending) {
-      if (sendSync(ll, hostSyncBri)) {
+    if (!rl.txPending) {
+      if (sendSync(rl, hostSyncBri)) {
         lastSyncQueuedMs = now;
         syncState = SyncState::AUTO_ALLOWED;
       }
@@ -369,10 +369,10 @@ static void sync_service(LoraLink::Core& ll) {
   }
 
   // 3) Auto-SYNC: only when idle and at most every 30s.
-  if (!idleForAutoSync(ll)) return;
+  if (!idleForAutoSync(rl)) return;
   if (lastSyncQueuedMs != 0 && (uint32_t)(now - lastSyncQueuedMs) < 30000UL) return;
 
-  if (sendSync(ll, hostSyncBri)) {
+  if (sendSync(rl, hostSyncBri)) {
     lastSyncQueuedMs = now;
   }
 }
@@ -388,7 +388,7 @@ void handleCommand() {
   // IDENTIFY (for port discovery)
   if (payloadLen == 1 && firstByte == 1) {
     char macstr[18];
-    LoraLink::mac6ToStr(ll.myMac6, macstr);
+    RaceLinkTransport::mac6ToStr(rl.myMac6, macstr);
     Serial.print(F(DEV_TYPE_STR));
     Serial.print(macstr);
     newSerialData = false;
@@ -396,7 +396,7 @@ void handleCommand() {
   }
 
   // New framing: TYPE_FULL + recv3 + body...
-  if ((firstByte & 0x80) == LoraProto::DIR_M2N && payloadLen >= 4) {
+  if ((firstByte & 0x80) == RaceLinkProto::DIR_M2N && payloadLen >= 4) {
     const uint8_t type_full = firstByte;
     const uint8_t recv3[3] = { receivedBytes[2], receivedBytes[3], receivedBytes[4] };
     const uint8_t bodyLen = (uint8_t)(payloadLen - 4);
@@ -404,75 +404,75 @@ void handleCommand() {
 
     uint8_t out[32]; uint8_t n = 0;
 
-    switch (LoraProto::type_base(type_full)) {
+    switch (RaceLinkProto::type_base(type_full)) {
 
-      case LoraProto::OPC_DEVICES: {
-        if (bodyLen == sizeof(LoraProto::P_GetDevices)) {
-          LoraProto::P_GetDevices p{};
+      case RaceLinkProto::OPC_DEVICES: {
+        if (bodyLen == sizeof(RaceLinkProto::P_GetDevices)) {
+          RaceLinkProto::P_GetDevices p{};
           memcpy(&p, body, sizeof(p));
-          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
-          LoraLink::scheduleSend(ll, out, n);
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
           // decide on RX window depending on the sent frame being a broadcast or unicast
-          if (LoraLink::isBroadcast3(recv3)) {
+          if (RaceLinkTransport::isBroadcast3(recv3)) {
             // unbekannte Zahl von Empfängern -> längeres RX-Fenster
-            LoraLink::requestRxTimed(ll, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
+            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
           } else {
             // unicast -> kürzeres RX-Fenster, nach nur einer Antwort RX beenden
-            LoraLink::requestRxTimed(ll, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
+            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
           }
-          //LoraLink::requestRxTimed(ll, RX_WINDOW_MS); // z.B. 2900ms
-          //LoraLink::scheduleSendThenRxWindow(ll, out, n, RX_WINDOW_MS);
+          //RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_MS); // z.B. 2900ms
+          //RaceLinkTransport::scheduleSendThenRxWindow(rl, out, n, RX_WINDOW_MS);
         }
       } break;
 
-      case LoraProto::OPC_SET_GROUP: {
-        if (bodyLen == sizeof(LoraProto::P_SetGroup)) {
-          LoraProto::P_SetGroup p{};
+      case RaceLinkProto::OPC_SET_GROUP: {
+        if (bodyLen == sizeof(RaceLinkProto::P_SetGroup)) {
+          RaceLinkProto::P_SetGroup p{};
           memcpy(&p, body, sizeof(p));
-          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
-          LoraLink::scheduleSend(ll, out, n);
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
 
-          if (LoraLink::isBroadcast3(recv3)) {
+          if (RaceLinkTransport::isBroadcast3(recv3)) {
             // unbekannte Zahl von Empfängern -> längeres RX-Fenster
-            LoraLink::requestRxTimed(ll, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
+            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
           } else {
             // unicast -> kürzeres RX-Fenster, nach nur einer Antwort RX beenden
-            LoraLink::requestRxTimed(ll, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
+            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
           }
-          //LoraLink::scheduleSendThenRxWindow(ll, out, n, RX_WINDOW_MS);
+          //RaceLinkTransport::scheduleSendThenRxWindow(rl, out, n, RX_WINDOW_MS);
         }
       } break;
 
-      case LoraProto::OPC_STATUS: {
-        if (bodyLen == sizeof(LoraProto::P_GetStatus)) {
-          LoraProto::P_GetStatus p{};
+      case RaceLinkProto::OPC_STATUS: {
+        if (bodyLen == sizeof(RaceLinkProto::P_GetStatus)) {
+          RaceLinkProto::P_GetStatus p{};
           memcpy(&p, body, sizeof(p));
-          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
-          LoraLink::scheduleSend(ll, out, n);
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
-          if (LoraLink::isBroadcast3(recv3)) {
+          if (RaceLinkTransport::isBroadcast3(recv3)) {
             // unbekannte Zahl von Empfängern -> längeres RX-Fenster
-            LoraLink::requestRxTimed(ll, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
+            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
           } else {
             // unicast -> kürzeres RX-Fenster, nach nur einer Antwort RX beenden
-            LoraLink::requestRxTimed(ll, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
+            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
           }
-          //LoraLink::scheduleSendThenRxWindow(ll, out, n, RX_WINDOW_MS);
+          //RaceLinkTransport::scheduleSendThenRxWindow(rl, out, n, RX_WINDOW_MS);
         }
       } break;
       
-      case LoraProto::OPC_CONTROL: {
-        if (bodyLen == sizeof(LoraProto::P_Control)) {
-          LoraProto::P_Control p{};
+      case RaceLinkProto::OPC_CONTROL: {
+        if (bodyLen == sizeof(RaceLinkProto::P_Control)) {
+          RaceLinkProto::P_Control p{};
           memcpy(&p, body, sizeof(p));
 
           // remember brightness for auto-sync (host may choose to ignore it on the nodes)
           hostSyncBri = p.brightness;
 
-          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
-          bool ok = LoraLink::scheduleSend(ll, out, n);
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          bool ok = RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
 
           // If this CONTROL arms a sync-start, block auto-sync until host triggers OPC_SYNC.
@@ -482,35 +482,35 @@ void handleCommand() {
         }
       } break;
 
-      case LoraProto::OPC_CONFIG: {
-        if (bodyLen == sizeof(LoraProto::P_Config)) {
-          LoraProto::P_Config p{};
+      case RaceLinkProto::OPC_CONFIG: {
+        if (bodyLen == sizeof(RaceLinkProto::P_Config)) {
+          RaceLinkProto::P_Config p{};
           memcpy(&p, body, sizeof(p));
-          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
-          bool ok = LoraLink::scheduleSend(ll, out, n);
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          bool ok = RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
           if (ok) {
-            if (LoraLink::isBroadcast3(recv3)) {
+            if (RaceLinkTransport::isBroadcast3(recv3)) {
               // CONFIG should be unicast, but if broadcast, allow longer RX window
-              LoraLink::requestRxTimed(ll, RX_WINDOW_BROADCAST_MS);
+              RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_BROADCAST_MS);
             } else {
-              LoraLink::requestRxTimed(ll, RX_WINDOW_UNICAST_MS, 1);
+              RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_UNICAST_MS, 1);
             }
           }
         }
       } break;
 
-      case LoraProto::OPC_SYNC: {
+      case RaceLinkProto::OPC_SYNC: {
         // Host triggers a global SYNC NOW (broadcast). Body is fixed-size P_Sync (brightness is used).
-        if (bodyLen == sizeof(LoraProto::P_Sync)) {
-          LoraProto::P_Sync p{};
+        if (bodyLen == sizeof(RaceLinkProto::P_Sync)) {
+          RaceLinkProto::P_Sync p{};
           memcpy(&p, body, sizeof(p));
 
           // brightness to use for this (possibly retried) host-triggered sync
           hostSyncBri = p.brightness;
 
           // Try to queue immediately (no CAD/LBT). If TX is busy, retry ASAP in sync_service().
-          if (sendSync(ll, hostSyncBri)) {
+          if (sendSync(rl, hostSyncBri)) {
             lastSyncQueuedMs = millis();
             syncState = SyncState::AUTO_ALLOWED;   // host sync done -> auto sync allowed again (30s gate applies)
           } else {
@@ -519,13 +519,13 @@ void handleCommand() {
         }
       } break;
 
-      case LoraProto::OPC_STREAM: {
+      case RaceLinkProto::OPC_STREAM: {
         if (bodyLen > 0) {
-          const bool isBroadcast = LoraLink::isBroadcast3(recv3);
+          const bool isBroadcast = RaceLinkTransport::isBroadcast3(recv3);
           const uint16_t rxWindowMs = isBroadcast ? RX_WINDOW_BROADCAST_MS : RX_WINDOW_UNICAST_MS;
           const int8_t rxNumWanted = isBroadcast ? -1 : 1;
-          LoraLink::scheduleStreamSend(ll, body, bodyLen, ll.myLast3, recv3, type_full,
-                                       rxWindowMs, rxNumWanted);
+          RaceLinkTransport::scheduleStreamSend(rl, body, bodyLen, rl.myLast3, recv3, type_full,
+                                                rxWindowMs, rxNumWanted);
         }
       } break;
 
@@ -538,14 +538,14 @@ void handleCommand() {
   newSerialData = false;
 }
 
-/************ LoRa to USB Forwarding ************/
-static inline void usb_forward_lora(const uint8_t* pkt, uint8_t len, int16_t rssi, int8_t snr) {
-  if (len < sizeof(LoraProto::Header7)) return;
+/************ RaceLink transport to USB forwarding ************/
+static inline void usb_forward_transport(const uint8_t* pkt, uint8_t len, int16_t rssi, int8_t snr) {
+  if (len < sizeof(RaceLinkProto::Header7)) return;
   
-  // TODO header filtern -> nun in lora_link_core.h
-  //if (!LoraLink::receiverMatches(pkt.h.receiver3, myLast3)) return;  // broadcast ODER exakt meine 3B
+  // TODO header filtern -> nun in racelink_transport_core.h
+  //if (!RaceLinkTransport::receiverMatches(pkt.h.receiver3, myLast3)) return;  // broadcast ODER exakt meine 3B
 
-  const uint8_t type = pkt[sizeof(LoraProto::Header7)-1]; // header.type
+  const uint8_t type = pkt[sizeof(RaceLinkProto::Header7)-1]; // header.type
   uint8_t tmp[35];
   if (len > 32) len = 32;
   memcpy(tmp, pkt, len);
@@ -556,11 +556,11 @@ static inline void usb_forward_lora(const uint8_t* pkt, uint8_t len, int16_t rss
   usb_send_frame(type, tmp, (uint8_t)(len+3));
 }
 
-/************ LoRa Init (RadioLib) ************/
-void lora_init() {
+/************ RaceLink transport init (RadioLib) ************/
+void transport_init() {
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
 
-  LoraLink::PhyCfg phy;
+  RaceLinkTransport::PhyCfg phy;
   phy.freqMHz   = (float)RF_FREQUENCY_HZ / 1e6f;
   phy.bwKHz     = LORA_BW_KHZ;
   phy.sf        = LORA_SF;
@@ -574,18 +574,18 @@ void lora_init() {
   phy.dio2RfSwitch = 1;                   // vorher: radio.setDio2AsRfSwitch(true);
   phy.rxBoost      = -1;                  // (lassen) oder 1/0 je nach Board
 
-  if (!LoraLink::beginCommon(radio, ll, phy)) {
+  if (!RaceLinkTransport::beginCommon(radio, rl, phy)) {
     // Fehlerhandling wie bisher
     radio = nullptr; // von node übernommen
   }
 
-  //ll.radio = &radio; wird nun in der LoraLink::beginCommon gesetzt
+  //rl.radio = &radio; wird nun in der RaceLinkTransport::beginCommon gesetzt
 
   // LBT aktivieren oder deaktivieren:
-  ll.lbtEnable = true;   // default: false
+  rl.lbtEnable = true;   // default: false
   
-  LoraLink::attachDio1(radio, ll);
-  LoraLink::setDefaultIdle(ll);
+  RaceLinkTransport::attachDio1(radio, rl);
+  RaceLinkTransport::setDefaultIdle(rl);
 }
 
 // --- benannte Callbacks (Master) ---
@@ -606,7 +606,7 @@ static void on_rx_open_cb(uint16_t ms, void* ctx) {
 }
 
 static void on_rx_packet_cb(const uint8_t* pkt, uint8_t len, int16_t rssi, int8_t snr, void* ctx) {
-  usb_forward_lora(pkt, len, rssi, snr);
+  usb_forward_transport(pkt, len, rssi, snr);
   drawStatus();                   // RX-Zähler inkrementiert + Anzeige
   drawDebug(pkt, len);
 }
@@ -650,18 +650,18 @@ void setup() {
 
   u8g2.begin();
 
-  // kann weg, da in lora_link_core.h beginCommon integriert
+  // kann weg, da in racelink_transport_core.h beginCommon integriert
 /*   // MAC lesen
-  if (LoraLink::readEfuseMac6(myMac6)) {
+  if (RaceLinkTransport::readEfuseMac6(myMac6)) {
     macReadOK = true;
-    LoraLink::last3FromMac6(myLast3, myMac6);
+    RaceLinkTransport::last3FromMac6(myLast3, myMac6);
   } else {
     macReadOK = false;
     memset(myLast3, 0, 3);
   } */
 
-  // LoRa
-  lora_init();
+  // RaceLink transport
+  transport_init();
   cb.onTxStart       = on_tx_start_cb;
   cb.onTxDone        = on_tx_done_cb;
   cb.onRxWindowOpen  = on_rx_open_cb;
@@ -673,7 +673,7 @@ void setup() {
   // Startanzeige
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawStr(0, 12, "LoRa Init...");
+  u8g2.drawStr(0, 12, "RaceLink Init...");
   u8g2.sendBuffer();
   delay(150);
   drawStatus();
@@ -683,8 +683,8 @@ void loop() {
 
   recvSerialBytes();
   handleCommand();
-  LoraLink::service(ll, cb); // an erster stelle??
-  sync_service(ll);
+  RaceLinkTransport::service(rl, cb); // an erster stelle??
+  sync_service(rl);
   
   // Button: Falling erkannt?
   if (btnFallingFlag) {

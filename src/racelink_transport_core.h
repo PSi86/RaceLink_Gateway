@@ -1,4 +1,4 @@
-// lora_link_core.h -- shared LoRa "link layer" for ESP32 + SX1262 (RadioLib)
+// racelink_transport_core.h -- shared RaceLink transport core for ESP32 + SX1262 (RadioLib)
 // Header-only, Arduino-friendly. No heap allocations.
 // - Unifies DIO1 ISR flagging + state machine (Idle/Tx/Rx)
 // - Shared TX scheduler (with optional random backoff)
@@ -7,14 +7,14 @@
 //
 // How to use (short):
 //   1) Board code creates SX1262 radio with its own pins (Module(cs,dio1,rst,busy,spi)).
-//   2) Call LoraLink::beginCommon(radio, cfg) with PHY config (freq, bw, sf, cr, ...).
+//   2) Call RaceLinkTransport::beginCommon(radio, cfg) with PHY config (freq, bw, sf, cr, ...).
 //      Optionally leave device-specific options unset: txPowerDbm/dio2RfSwitch/rxBoost have defaults.
-//   3) Keep one LoraLink::Core 'll' per device. Attach ISR once via LoraLink::attachDio1(radio, ll).
+//   3) Keep one RaceLinkTransport::Core 'rl' per device. Attach ISR once via RaceLinkTransport::attachDio1(radio, rl).
 //   4) Define callbacks (onRxPacket, onTxDone, ...).
-//   5) In loop(): LoraLink::service(ll, cb).
-//   6) For Master-style RX window: LoraLink::requestRxWindow(ll, windowMs).
-//      For Node continuous RX: LoraLink::requestRxWindow(ll, 0) once (or at setup()).
-//   7) For sending: schedule with LoraLink::scheduleSend(...) or scheduleSendWithBackoff(...).
+//   5) In loop(): RaceLinkTransport::service(rl, cb).
+//   6) For Master-style RX window: RaceLinkTransport::requestRxWindow(rl, windowMs).
+//      For Node continuous RX: RaceLinkTransport::requestRxWindow(rl, 0) once (or at setup()).
+//   7) For sending: schedule with RaceLinkTransport::scheduleSend(...) or scheduleSendWithBackoff(...).
 //
 // Notes:
 // - This file intentionally does NOT know the pinout. Keep Module() creation in each firmware.
@@ -28,19 +28,19 @@
 // --- shield RadioLib from global "#define random" in WLED -----------------
 #ifdef random
   #undef random
-  #define LL__RESTORE_RANDOM_MACRO_AFTER_RADIOLIB 1
+  #define RL__RESTORE_RANDOM_MACRO_AFTER_RADIOLIB 1
 #endif
 
 #include <Arduino.h>
 
 #include <RadioLib.h>
 
-#include "lora_proto.h"
+#include "racelink_proto.h"
 extern "C" {
   #include <esp_mac.h>
 }
 
-namespace LoraLink {
+namespace RaceLinkTransport {
 
 // -------------------- PHY config with device-specific overrides --------------------
 struct PhyCfg {
@@ -90,7 +90,7 @@ struct Core {
   #elif defined(GATE_LORA_LLCC68)
     LLCC68*   radio             = nullptr;
   #else
-    #error "No LoRa radio module defined"
+    #error "No supported radio module defined"
   #endif
   
   volatile bool dio1Flag      = false;
@@ -163,18 +163,18 @@ struct Core {
 
 // -------------------- Static ISR trampoline --------------------
 #if defined(ESP32)
-  #define LL_ISR_ATTR IRAM_ATTR
+  #define RL_ISR_ATTR IRAM_ATTR
 #else
-  #define LL_ISR_ATTR
+  #define RL_ISR_ATTR
 #endif
 
 // Each binary has at most one radio/Core pair ⇒ one trampoline is sufficient.
-static Core* volatile g_ll = nullptr;
+static Core* volatile g_rl = nullptr;
 
-static void LL_ISR_ATTR onDio1ISR_trampoline() {
-  if (g_ll) {
-    g_ll->dio1Flag = true;
-    //g_ll->irqFlags = g_ll->radio->getIrqFlags();
+static void RL_ISR_ATTR onDio1ISR_trampoline() {
+  if (g_rl) {
+    g_rl->dio1Flag = true;
+    //g_rl->irqFlags = g_rl->radio->getIrqFlags();
   }
 }
 
@@ -227,233 +227,233 @@ inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]
 
 // Maximaler LBT-Backoff in Millisekunden basierend auf time-on-air für das längste Paket
 // (für 17-Byte-Paket ca. 51 ms bei SF7BW125CR45)
-inline uint16_t lbtBackoffMaxMs(const Core& ll) {
-  uint32_t ms = ll.toaUsMax17 / 1000U;   // floor(ToA/1000)
+inline uint16_t lbtBackoffMaxMs(const Core& rl) {
+  uint32_t ms = rl.toaUsMax17 / 1000U;   // floor(ToA/1000)
   return (ms < 5U) ? 5U : (uint16_t)ms;  // mind. 5 ms
 }
 
 // RadioLib RNG: random(minMs, maxMs). Inklusive oberer Rand => maxMs+1
-inline uint16_t randMs(Core& ll, uint16_t minMs, uint16_t maxMs) {
+inline uint16_t randMs(Core& rl, uint16_t minMs, uint16_t maxMs) {
   if (maxMs <= minMs) return minMs;
   const int32_t lo = (int32_t)minMs;
   const int32_t hiExclusive = (int32_t)maxMs + 1;
-  int32_t r = ll.radio
-                ? ll.radio->random(lo, hiExclusive)      // PhysicalLayer::random
+  int32_t r = rl.radio
+                ? rl.radio->random(lo, hiExclusive)      // PhysicalLayer::random
                 : (int32_t)::random((long)lo, (long)hiExclusive);
   return (uint16_t)r;
 }
 
 // -------------------- RX/TX mode helpers --------------------
-inline void setDefaultIdle(Core& ll) {
-  ll.defaultRxKind = RxKind::None;
-  ll.defaultRxMs   = 0;
+inline void setDefaultIdle(Core& rl) {
+  rl.defaultRxKind = RxKind::None;
+  rl.defaultRxMs   = 0;
 }
-inline void setDefaultRxContinuous(Core& ll) {
-  ll.defaultRxKind = RxKind::Continuous;
-  ll.defaultRxMs   = 0; // echt kontinuierlich
-  ll.reqRxKind = RxKind::Continuous;
-  ll.reqRxMs = 0;
+inline void setDefaultRxContinuous(Core& rl) {
+  rl.defaultRxKind = RxKind::Continuous;
+  rl.defaultRxMs   = 0; // echt kontinuierlich
+  rl.reqRxKind = RxKind::Continuous;
+  rl.reqRxMs = 0;
 }
-inline void requestRxTimed(Core& ll, uint16_t windowMs, int8_t rxNumWanted = -1) {
-  ll.reqRxKind = RxKind::Timed;
-  ll.reqRxMs = windowMs;
-  ll.rxNumWanted = rxNumWanted;
-  ll.changeMode = true; // force window (re)open even if already in Timed RX
+inline void requestRxTimed(Core& rl, uint16_t windowMs, int8_t rxNumWanted = -1) {
+  rl.reqRxKind = RxKind::Timed;
+  rl.reqRxMs = windowMs;
+  rl.rxNumWanted = rxNumWanted;
+  rl.changeMode = true; // force window (re)open even if already in Timed RX
 }
-inline void requestRxContinuous(Core& ll) {
-  ll.reqRxKind = RxKind::Continuous;
-  ll.reqRxMs = 0;
+inline void requestRxContinuous(Core& rl) {
+  rl.reqRxKind = RxKind::Continuous;
+  rl.reqRxMs = 0;
 }
-inline void cancelRxRequest(Core& ll) {
-  ll.changeMode = true;
-  ll.rfMode = Mode::Idle;
-  ll.reqRxKind = RxKind::None;
-  ll.reqRxMs = 0;
+inline void cancelRxRequest(Core& rl) {
+  rl.changeMode = true;
+  rl.rfMode = Mode::Idle;
+  rl.reqRxKind = RxKind::None;
+  rl.reqRxMs = 0;
 }
 
 // One-slot TX scheduling (returns false if slot busy or oversize).
 // with LBT enabled jitterMaxMs is overridden with 300ms -> do it based on ToA?!
 // without LBT and jitterMaxMs>50 the given jitterMaxMs is used to delay the TX
 // without LBT and jitterMaxMs=0 the TX is scheduled immediately
-inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500) {
+inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500) {
 
-  if (ll.txPending || len == 0 || len > sizeof(ll.txBuf)) return false; // Check for pending TX or oversize
-  memcpy(ll.txBuf, buf, len);
-  ll.txLen = len;
-  ll.earliestTxAtMs = millis();
+  if (rl.txPending || len == 0 || len > sizeof(rl.txBuf)) return false; // Check for pending TX or oversize
+  memcpy(rl.txBuf, buf, len);
+  rl.txLen = len;
+  rl.earliestTxAtMs = millis();
   
   uint16_t jitterMinMs = 50; // default min jitter
 
-  if (ll.lbtEnable) {
-    //jitterMaxMs = lbtBackoffMaxMs(ll);
+  if (rl.lbtEnable) {
+    //jitterMaxMs = lbtBackoffMaxMs(rl);
     jitterMaxMs = 300; // fixed max backoff for LBT
-    uint16_t randDelayMs = randMs(ll, jitterMinMs, jitterMaxMs);
-    //ll.debug = randDelayMs;
-    ll.earliestTxAtMs += randDelayMs;
-    ll.txArb = TxArbiter::CadNeeded;
+    uint16_t randDelayMs = randMs(rl, jitterMinMs, jitterMaxMs);
+    //rl.debug = randDelayMs;
+    rl.earliestTxAtMs += randDelayMs;
+    rl.txArb = TxArbiter::CadNeeded;
   } 
   else {
     if (jitterMaxMs == 0) {
-      ll.earliestTxAtMs += 0; // no delay
+      rl.earliestTxAtMs += 0; // no delay
     }
     else if (jitterMaxMs > jitterMinMs) {
-      ll.earliestTxAtMs += randMs(ll, jitterMinMs, jitterMaxMs);
+      rl.earliestTxAtMs += randMs(rl, jitterMinMs, jitterMaxMs);
     }
     else {
-      ll.earliestTxAtMs += randMs(ll, jitterMinMs, 300); // at least some jitter
+      rl.earliestTxAtMs += randMs(rl, jitterMinMs, 300); // at least some jitter
     }
-    ll.txArb = TxArbiter::None;
+    rl.txArb = TxArbiter::None;
   }
 
-  ll.debug = 0;
-  ll.txPending = true; // mark TX as pending
+  rl.debug = 0;
+  rl.txPending = true; // mark TX as pending
   return true;
 }
 
-inline bool scheduleSendThenRxWindow(Core& ll, const uint8_t* buf, uint8_t len, uint16_t rxMs) {
+inline bool scheduleSendThenRxWindow(Core& rl, const uint8_t* buf, uint8_t len, uint16_t rxMs) {
   // TODO: so noch ok oder muss an LBT angepasst werden? Wird aktuell nicht genutzt.
-  if (!scheduleSend(ll, buf, len)) return false;
-  requestRxTimed(ll, rxMs);
+  if (!scheduleSend(rl, buf, len)) return false;
+  requestRxTimed(rl, rxMs);
   return true;
 }
 
-// Small wrapper for building + scheduling a typed payload (using LoraProto).
+// Small wrapper for building + scheduling a typed payload (using RaceLinkProto).
 template<typename PayloadT>
-inline bool buildAndSchedule(Core& ll, const uint8_t my3[3], const uint8_t dst3[3],
+inline bool buildAndSchedule(Core& rl, const uint8_t my3[3], const uint8_t dst3[3],
                              uint8_t fullType, const PayloadT& p) {
-  uint8_t out[sizeof(LoraProto::Header7) + sizeof(PayloadT)];
-  uint8_t n = LoraProto::build(out, my3, dst3, fullType, p);
-  return scheduleSend(ll, out, n);
+  uint8_t out[sizeof(RaceLinkProto::Header7) + sizeof(PayloadT)];
+  uint8_t n = RaceLinkProto::build(out, my3, dst3, fullType, p);
+  return scheduleSend(rl, out, n);
 }
 
-inline bool buildEmptyAndSchedule(Core& ll, const uint8_t my3[3], const uint8_t dst3[3],
+inline bool buildEmptyAndSchedule(Core& rl, const uint8_t my3[3], const uint8_t dst3[3],
                                   uint8_t fullType) {
-  uint8_t out[sizeof(LoraProto::Header7)];
-  uint8_t n = LoraProto::build_empty(out, my3, dst3, fullType);
-  return scheduleSend(ll, out, n);
+  uint8_t out[sizeof(RaceLinkProto::Header7)];
+  uint8_t n = RaceLinkProto::build_empty(out, my3, dst3, fullType);
+  return scheduleSend(rl, out, n);
 }
 
 // -------------------- Stream helpers --------------------
 enum class StreamStatus : uint8_t { StreamStart, StreamContinue, StreamEnd, Error };
 
-inline const uint8_t* streamBuffer(const Core& ll, uint8_t& len) {
-  len = ll.streamLen;
-  return ll.streamBuf;
+inline const uint8_t* streamBuffer(const Core& rl, uint8_t& len) {
+  len = rl.streamLen;
+  return rl.streamBuf;
 }
 
-inline void clearStreamReady(Core& ll) {
-  ll.streamReady = false;
+inline void clearStreamReady(Core& rl) {
+  rl.streamReady = false;
 }
 
-inline bool scheduleStreamSend(Core& ll, const uint8_t* data, uint8_t len,
+inline bool scheduleStreamSend(Core& rl, const uint8_t* data, uint8_t len,
                                const uint8_t src3[3], const uint8_t dst3[3],
                                uint8_t fullType, uint16_t rxMs, int8_t rxNumWanted = 1) {
-  constexpr uint8_t kChunkLen = sizeof(LoraProto::P_Stream::data);
+  constexpr uint8_t kChunkLen = sizeof(RaceLinkProto::P_Stream::data);
   constexpr uint8_t kMaxLen = 16 * kChunkLen;
-  if (ll.streamActive || ll.txPending || ll.streamMode != Core::StreamMode::None) return false;
+  if (rl.streamActive || rl.txPending || rl.streamMode != Core::StreamMode::None) return false;
   if (!data || len == 0 || len > kMaxLen) return false;
   const uint8_t totalPackets = static_cast<uint8_t>((len + kChunkLen - 1U) / kChunkLen);
   if (totalPackets < 2 || totalPackets > 16) return false;
 
   const uint8_t paddedLen = static_cast<uint8_t>(totalPackets * kChunkLen);
-  memset(ll.streamBuf, 0, paddedLen);
-  memcpy(ll.streamBuf, data, len);
-  ll.streamMode = Core::StreamMode::Tx;
-  ll.streamActive = true;
-  ll.streamReady = false;
-  ll.streamLastScheduled = false;
-  ll.streamLen = paddedLen;
-  ll.streamOffset = 0;
-  ll.streamTotalPackets = totalPackets;
-  ll.streamIndex = 0;
-  ll.streamPostRxMs = rxMs;
-  ll.streamPostRxNumWanted = rxNumWanted;
-  ll.streamType = fullType;
-  memcpy(ll.streamDst3, dst3, sizeof(ll.streamDst3));
-  memcpy(ll.streamSrc3, src3, sizeof(ll.streamSrc3));
+  memset(rl.streamBuf, 0, paddedLen);
+  memcpy(rl.streamBuf, data, len);
+  rl.streamMode = Core::StreamMode::Tx;
+  rl.streamActive = true;
+  rl.streamReady = false;
+  rl.streamLastScheduled = false;
+  rl.streamLen = paddedLen;
+  rl.streamOffset = 0;
+  rl.streamTotalPackets = totalPackets;
+  rl.streamIndex = 0;
+  rl.streamPostRxMs = rxMs;
+  rl.streamPostRxNumWanted = rxNumWanted;
+  rl.streamType = fullType;
+  memcpy(rl.streamDst3, dst3, sizeof(rl.streamDst3));
+  memcpy(rl.streamSrc3, src3, sizeof(rl.streamSrc3));
   return true;
 }
 
-inline bool queueNextStreamPacket(Core& ll) {
-  constexpr uint8_t kChunkLen = sizeof(LoraProto::P_Stream::data);
-  if (ll.streamMode != Core::StreamMode::Tx || !ll.streamActive || ll.txPending) return false;
-  if (ll.streamIndex >= ll.streamTotalPackets) return false;
+inline bool queueNextStreamPacket(Core& rl) {
+  constexpr uint8_t kChunkLen = sizeof(RaceLinkProto::P_Stream::data);
+  if (rl.streamMode != Core::StreamMode::Tx || !rl.streamActive || rl.txPending) return false;
+  if (rl.streamIndex >= rl.streamTotalPackets) return false;
 
-  const bool isStart = (ll.streamIndex == 0);
-  const bool isStop = (ll.streamIndex == static_cast<uint8_t>(ll.streamTotalPackets - 1));
-  const uint8_t packetsLeft = static_cast<uint8_t>((ll.streamTotalPackets - 1) - ll.streamIndex);
+  const bool isStart = (rl.streamIndex == 0);
+  const bool isStop = (rl.streamIndex == static_cast<uint8_t>(rl.streamTotalPackets - 1));
+  const uint8_t packetsLeft = static_cast<uint8_t>((rl.streamTotalPackets - 1) - rl.streamIndex);
 
-  LoraProto::P_Stream p{};
-  p.ctrl = LoraProto::encode_stream_ctrl(isStart, isStop, packetsLeft);
-  memcpy(p.data, &ll.streamBuf[ll.streamOffset], kChunkLen);
+  RaceLinkProto::P_Stream p{};
+  p.ctrl = RaceLinkProto::encode_stream_ctrl(isStart, isStop, packetsLeft);
+  memcpy(p.data, &rl.streamBuf[rl.streamOffset], kChunkLen);
 
-  uint8_t out[sizeof(LoraProto::Header7) + sizeof(LoraProto::P_Stream)];
-  uint8_t n = LoraProto::build(out, ll.streamSrc3, ll.streamDst3, ll.streamType, p);
-  if (!scheduleSend(ll, out, n, 0)) return false;
+  uint8_t out[sizeof(RaceLinkProto::Header7) + sizeof(RaceLinkProto::P_Stream)];
+  uint8_t n = RaceLinkProto::build(out, rl.streamSrc3, rl.streamDst3, rl.streamType, p);
+  if (!scheduleSend(rl, out, n, 0)) return false;
 
-  ll.streamOffset += kChunkLen;
-  ++ll.streamIndex;
-  ll.streamLastScheduled = isStop;
+  rl.streamOffset += kChunkLen;
+  ++rl.streamIndex;
+  rl.streamLastScheduled = isStop;
   return true;
 }
 
-inline StreamStatus handleStreamPacket(Core& ll, const LoraProto::P_Stream& pkt) {
+inline StreamStatus handleStreamPacket(Core& rl, const RaceLinkProto::P_Stream& pkt) {
   constexpr uint8_t kStreamDataLen = sizeof(pkt.data);
   constexpr uint8_t kMaxPackets = 16;
-  const LoraProto::StreamCtrl ctrl = LoraProto::decode_stream_ctrl(pkt.ctrl);
+  const RaceLinkProto::StreamCtrl ctrl = RaceLinkProto::decode_stream_ctrl(pkt.ctrl);
 
   if (ctrl.packets_left >= kMaxPackets) return StreamStatus::Error;
-  if (ll.streamMode == Core::StreamMode::Tx) return StreamStatus::Error;
+  if (rl.streamMode == Core::StreamMode::Tx) return StreamStatus::Error;
 
   if (ctrl.start) {
     if (ctrl.stop || ctrl.packets_left == 0) return StreamStatus::Error;
-    ll.streamMode = Core::StreamMode::Rx;
-    ll.streamActive = true;
-    ll.streamReady = false;
-    ll.streamLen = 0;
-    ll.streamOffset = 0;
-    ll.streamLastPacketsLeft = ctrl.packets_left;
-    if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
-    memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
-    ll.streamOffset += kStreamDataLen;
-    ll.streamLen = ll.streamOffset;
+    rl.streamMode = Core::StreamMode::Rx;
+    rl.streamActive = true;
+    rl.streamReady = false;
+    rl.streamLen = 0;
+    rl.streamOffset = 0;
+    rl.streamLastPacketsLeft = ctrl.packets_left;
+    if (rl.streamOffset + kStreamDataLen > sizeof(rl.streamBuf)) return StreamStatus::Error;
+    memcpy(&rl.streamBuf[rl.streamOffset], pkt.data, kStreamDataLen);
+    rl.streamOffset += kStreamDataLen;
+    rl.streamLen = rl.streamOffset;
     return StreamStatus::StreamStart;
   }
 
-  if (!ll.streamActive) return StreamStatus::Error;
+  if (!rl.streamActive) return StreamStatus::Error;
 
   if (ctrl.stop) {
-    if (ctrl.packets_left != 0 || ll.streamLastPacketsLeft != 1) return StreamStatus::Error;
-    if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
-    memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
-    ll.streamOffset += kStreamDataLen;
-    ll.streamLen = ll.streamOffset;
-    ll.streamActive = false;
-    ll.streamReady = true;
-    ll.streamLastPacketsLeft = 0;
-    ll.streamMode = Core::StreamMode::None;
+    if (ctrl.packets_left != 0 || rl.streamLastPacketsLeft != 1) return StreamStatus::Error;
+    if (rl.streamOffset + kStreamDataLen > sizeof(rl.streamBuf)) return StreamStatus::Error;
+    memcpy(&rl.streamBuf[rl.streamOffset], pkt.data, kStreamDataLen);
+    rl.streamOffset += kStreamDataLen;
+    rl.streamLen = rl.streamOffset;
+    rl.streamActive = false;
+    rl.streamReady = true;
+    rl.streamLastPacketsLeft = 0;
+    rl.streamMode = Core::StreamMode::None;
     return StreamStatus::StreamEnd;
   }
 
   if (ctrl.packets_left == 0) return StreamStatus::Error;
-  if (ctrl.packets_left != static_cast<uint8_t>(ll.streamLastPacketsLeft - 1)) return StreamStatus::Error;
-  if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
-  memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
-  ll.streamOffset += kStreamDataLen;
-  ll.streamLen = ll.streamOffset;
-  ll.streamLastPacketsLeft = ctrl.packets_left;
+  if (ctrl.packets_left != static_cast<uint8_t>(rl.streamLastPacketsLeft - 1)) return StreamStatus::Error;
+  if (rl.streamOffset + kStreamDataLen > sizeof(rl.streamBuf)) return StreamStatus::Error;
+  memcpy(&rl.streamBuf[rl.streamOffset], pkt.data, kStreamDataLen);
+  rl.streamOffset += kStreamDataLen;
+  rl.streamLen = rl.streamOffset;
+  rl.streamLastPacketsLeft = ctrl.packets_left;
   return StreamStatus::StreamContinue;
 }
 
 // -------------------- Radio initialization common code --------------------
 #if defined(GATE_LORA_SX1262)
-inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
+inline bool beginCommon(SX1262& radio, Core& rl, const PhyCfg& cfg) {
 #elif defined(GATE_LORA_LLCC68)
-inline bool beginCommon(LLCC68& radio, Core& ll, const PhyCfg& cfg) {
+inline bool beginCommon(rlCC68& radio, Core& rl, const PhyCfg& cfg) {
 #else
-  #error "No LoRa radio module defined"
+  #error "No supported radio module defined"
 #endif
-//inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
+//inline bool beginCommon(SX1262& radio, Core& rl, const PhyCfg& cfg) {
   const int8_t power = (cfg.txPowerDbm == INT8_MIN) ? 14 : cfg.txPowerDbm;
 
   int16_t st = radio.begin(cfg.freqMHz, cfg.bwKHz, cfg.sf, cfg.crDen,
@@ -466,24 +466,24 @@ inline bool beginCommon(LLCC68& radio, Core& ll, const PhyCfg& cfg) {
 
   radio.standby();        // ensure standby after init
 
-  if(readEfuseMac6(ll.myMac6)) {
-    ll.macReadOK = true;
-    last3FromMac6(ll.myLast3, ll.myMac6);
+  if(readEfuseMac6(rl.myMac6)) {
+    rl.macReadOK = true;
+    last3FromMac6(rl.myLast3, rl.myMac6);
   }
   
-  ll.radio = &radio;
-  ll.toaUsMax17 = radio.getTimeOnAir(16);   // µs // 51ms for 16B @ SF7BW125CR45
-  g_ll = &ll;
+  rl.radio = &radio;
+  rl.toaUsMax17 = radio.getTimeOnAir(16);   // µs // 51ms for 16B @ SF7BW125CR45
+  g_rl = &rl;
 
   return true;
 }
 
 #if defined(GATE_LORA_SX1262)
-inline void attachDio1(SX1262& radio, Core& ll) {
+inline void attachDio1(SX1262& radio, Core& rl) {
   radio.setDio1Action(onDio1ISR_trampoline);
 }
 #elif defined(GATE_LORA_LLCC68)
-inline void attachDio1(LLCC68& radio, Core& ll) {
+inline void attachDio1(rlCC68& radio, Core& rl) {
   radio.setDio1Action(onDio1ISR_trampoline);
 }
 #else
@@ -491,100 +491,100 @@ inline void attachDio1(LLCC68& radio, Core& ll) {
 #endif
 
 // -------------------- The service pump (call in loop()) --------------------
-inline void service(Core& ll, const Callbacks& cb) {
+inline void service(Core& rl, const Callbacks& cb) {
   const uint32_t now = millis();
 
   // (A) IRQ: TX-Done oder RX-Paket
-  if (ll.dio1Flag) {
-    ll.dio1Flag = false;
+  if (rl.dio1Flag) {
+    rl.dio1Flag = false;
 
-    if (ll.rfMode == Mode::Rx) {
-      size_t len = ll.radio->getPacketLength();
-      if (len >= sizeof(LoraProto::Header7)) {
+    if (rl.rfMode == Mode::Rx) {
+      size_t len = rl.radio->getPacketLength();
+      if (len >= sizeof(RaceLinkProto::Header7)) {
         // TODO: ab hier nochmal checken! txBuf als maximale länge? -> besser hardcoden
         // können mehrere pakete im readData buffer enthalten sein?
 
-        if (len > sizeof(ll.txBuf)) len = sizeof(ll.txBuf);
+        if (len > sizeof(rl.txBuf)) len = sizeof(rl.txBuf);
         uint8_t pkt[64]; if (len > sizeof(pkt)) len = sizeof(pkt);
         
-        if (ll.radio->readData(pkt, len) == RADIOLIB_ERR_NONE) {
-          ++ll.rxCountTotal;
+        if (rl.radio->readData(pkt, len) == RADIOLIB_ERR_NONE) {
+          ++rl.rxCountTotal;
 
           // Try filtering out unwanted packets early disabled for debugging
-          LoraProto::Header7 h{};
-          if (!LoraProto::parseHeader(pkt, (uint8_t)len, h)) return;
-          if (!receiverMatches(h.receiver, ll.myLast3)) return;  // broadcast ODER exakt meine 3B
-          //if (LoraProto::type_dir(h.type) != LoraProto::DIR_M2N) return; // muss je nach rolle im hauptcode geprüft werden
+          RaceLinkProto::Header7 h{};
+          if (!RaceLinkProto::parseHeader(pkt, (uint8_t)len, h)) return;
+          if (!receiverMatches(h.receiver, rl.myLast3)) return;  // broadcast ODER exakt meine 3B
+          //if (RaceLinkProto::type_dir(h.type) != RaceLinkProto::DIR_M2N) return; // muss je nach rolle im hauptcode geprüft werden
 
-          ll.lastRssi = (int16_t)ll.radio->getRSSI(true);
-          ll.lastSnr  = (int8_t) ll.radio->getSNR();
+          rl.lastRssi = (int16_t)rl.radio->getRSSI(true);
+          rl.lastSnr  = (int8_t) rl.radio->getSNR();
 
-          if(ll.rxNumWanted > 0) --ll.rxNumWanted; // nur wenn begrenzte Anzahl erwartet
+          if(rl.rxNumWanted > 0) --rl.rxNumWanted; // nur wenn begrenzte Anzahl erwartet
          
-          ++ll.rxCountFiltered;
-          ll.lastRxAtMs = now;
-          if (cb.onRxPacket) cb.onRxPacket(pkt, (uint8_t)len, ll.lastRssi, ll.lastSnr, cb.ctx);
+          ++rl.rxCountFiltered;
+          rl.lastRxAtMs = now;
+          if (cb.onRxPacket) cb.onRxPacket(pkt, (uint8_t)len, rl.lastRssi, rl.lastSnr, cb.ctx);
         }
       }
       // Rx fortsetzen nicht nötig (nutze immer continuous RX)
-      /* if (!ll.txPending && ll.rxKind != RxKind::None) {
-        ll.radio->startReceive(); // nicht nötig, startReceive löst continuous RX aus
+      /* if (!rl.txPending && rl.rxKind != RxKind::None) {
+        rl.radio->startReceive(); // nicht nötig, startReceive löst continuous RX aus
       } */
     }
   }
 
-  if (!ll.txPending && ll.streamMode == Core::StreamMode::Tx && ll.streamActive) {
-    queueNextStreamPacket(ll);
+  if (!rl.txPending && rl.streamMode == Core::StreamMode::Tx && rl.streamActive) {
+    queueNextStreamPacket(rl);
   }
 
   // (B) Wenn im Idle, dann gewünschten Modus prüfen und wechseln
-  if(ll.rfMode == Mode::Idle) {
+  if(rl.rfMode == Mode::Idle) {
     // Idle → gewünschten Modus prüfen
 
-    if (ll.txPending) {
+    if (rl.txPending) {
       // TX steht an
-      ll.rfMode = Mode::Tx;
-      ll.changeMode = true;
-      //ll.reqRxKind = RxKind::None;
-      //ll.reqRxMs = 0;
+      rl.rfMode = Mode::Tx;
+      rl.changeMode = true;
+      //rl.reqRxKind = RxKind::None;
+      //rl.reqRxMs = 0;
       return;
     }
-    else if (ll.reqRxKind == RxKind::None && 
-      (ll.reqRxKind != ll.rxKind || ll.changeMode)) {
+    else if (rl.reqRxKind == RxKind::None && 
+      (rl.reqRxKind != rl.rxKind || rl.changeMode)) {
 
       // kein RX gewünscht, Idle festigen
-      ll.radio->standby();
-      ll.rxKind = RxKind::None;
-      ll.changeMode = false;
-      //ll.reqRxMs = 0; //unnötig
+      rl.radio->standby();
+      rl.rxKind = RxKind::None;
+      rl.changeMode = false;
+      //rl.reqRxMs = 0; //unnötig
       if (cb.onIdle) cb.onIdle(cb.ctx);
       return; // fertig
     }
-    else if (ll.reqRxKind != RxKind::None) {
+    else if (rl.reqRxKind != RxKind::None) {
 
       // RX gewünscht
-      ll.rfMode = Mode::Rx;
-      ll.changeMode = true;
+      rl.rfMode = Mode::Rx;
+      rl.changeMode = true;
       return; // fertig
     }
   }
 
   // (B) TX pending starten, wenn sendezeit erreicht, aber kein timed RX läuft
-  //if (ll.txPending && ll.rxKind != RxKind::Timed && (int32_t)(now - ll.earliestTxAtMs) >= 0) {
-  if (ll.rfMode == Mode::Tx) {
+  //if (rl.txPending && rl.rxKind != RxKind::Timed && (int32_t)(now - rl.earliestTxAtMs) >= 0) {
+  if (rl.rfMode == Mode::Tx) {
     
-    if (ll.changeMode) {
-      ll.radio->standby(); // sicherstellen, dass nichts mehr empfangen wird bis earliestTxAtMs
-      ll.changeMode = false; // TX jetzt durchziehen
+    if (rl.changeMode) {
+      rl.radio->standby(); // sicherstellen, dass nichts mehr empfangen wird bis earliestTxAtMs
+      rl.changeMode = false; // TX jetzt durchziehen
       if (cb.onTxStart) cb.onTxStart(cb.ctx);
     }
 
-    if((int32_t)(now - ll.earliestTxAtMs) < 0) {
+    if((int32_t)(now - rl.earliestTxAtMs) < 0) {
       return; // noch nicht Zeit zum Senden
     }
 
     // LBT / CAD wenn nötig
-    if (ll.txArb == TxArbiter::CadNeeded) {
+    if (rl.txArb == TxArbiter::CadNeeded) {
       // zum senden in scheduleSend nur txArb auf CadNeeded und txPending auf true setzen
       ChannelScanConfig_t cfg = {
         .cad = {
@@ -598,105 +598,105 @@ inline void service(Core& ll, const Callbacks& cb) {
         },
       };
 
-      //int16_t state = ll.radio->startChannelScan(cfg);
-      int16_t state = ll.radio->scanChannel(cfg);
+      //int16_t state = rl.radio->startChannelScan(cfg);
+      int16_t state = rl.radio->scanChannel(cfg);
       
       if (state != RADIOLIB_CHANNEL_FREE) {
         // busy → kurzen Backoff und erneut CAD wenn Zeit erreicht
-        ll.earliestTxAtMs = now + randMs(ll, 100, 200); // fixed backoff for LBT
-        ll.txArb = TxArbiter::CadNeeded;
-        ll.debug += 1; // debug counter für busy CAD
-        //if(ll.debug <= 2) ll.debug = 2;
+        rl.earliestTxAtMs = now + randMs(rl, 100, 200); // fixed backoff for LBT
+        rl.txArb = TxArbiter::CadNeeded;
+        rl.debug += 1; // debug counter für busy CAD
+        //if(rl.debug <= 2) rl.debug = 2;
         return; // kein weiterer Service jetzt
       }
       else {
-        ll.txArb = TxArbiter::None;
+        rl.txArb = TxArbiter::None;
         // weiter zum senden
       }
     }
-    if(ll.txArb == TxArbiter::None) {
+    if(rl.txArb == TxArbiter::None) {
       //if (cb.onTxStart) cb.onTxStart(cb.ctx); // schon bei CAD aufrufen?
-      if (ll.radio->transmit(ll.txBuf, ll.txLen) == RADIOLIB_ERR_NONE) {
-        ll.txPending = false;
-        //ll.reqRxKind = ll.defaultRxKind; // nach TX wieder in default RX modus wechseln
-        //ll.reqRxMs   = ll.defaultRxMs;
+      if (rl.radio->transmit(rl.txBuf, rl.txLen) == RADIOLIB_ERR_NONE) {
+        rl.txPending = false;
+        //rl.reqRxKind = rl.defaultRxKind; // nach TX wieder in default RX modus wechseln
+        //rl.reqRxMs   = rl.defaultRxMs;
         
-        ++ll.txCount;
-        ll.lastTxAtMs = now;
+        ++rl.txCount;
+        rl.lastTxAtMs = now;
         
-        //ll.debug = 100;
+        //rl.debug = 100;
         if (cb.onTxDone) cb.onTxDone(cb.ctx);        
         
-        if (ll.streamMode == Core::StreamMode::Tx && ll.streamLastScheduled) {
-          ll.streamMode = Core::StreamMode::None;
-          ll.streamActive = false;
-          ll.streamLastScheduled = false;
-          ll.streamLen = 0;
-          ll.streamOffset = 0;
-          ll.streamTotalPackets = 0;
-          ll.streamIndex = 0;
-          ll.streamType = 0;
-          if (ll.streamPostRxMs > 0) {
-            requestRxTimed(ll, ll.streamPostRxMs, ll.streamPostRxNumWanted);
+        if (rl.streamMode == Core::StreamMode::Tx && rl.streamLastScheduled) {
+          rl.streamMode = Core::StreamMode::None;
+          rl.streamActive = false;
+          rl.streamLastScheduled = false;
+          rl.streamLen = 0;
+          rl.streamOffset = 0;
+          rl.streamTotalPackets = 0;
+          rl.streamIndex = 0;
+          rl.streamType = 0;
+          if (rl.streamPostRxMs > 0) {
+            requestRxTimed(rl, rl.streamPostRxMs, rl.streamPostRxNumWanted);
           }
-          ll.streamPostRxMs = 0;
-          ll.streamPostRxNumWanted = -1;
+          rl.streamPostRxMs = 0;
+          rl.streamPostRxNumWanted = -1;
         }
 
-        ll.rfMode = Mode::Idle;
-        ll.changeMode = true;
+        rl.rfMode = Mode::Idle;
+        rl.changeMode = true;
 
         return; // gesendet, nun platz machen für restlichen code
       }
       else {
-        ll.txArb = TxArbiter::CadNeeded;
+        rl.txArb = TxArbiter::CadNeeded;
         return;
       }
     }
   }
   // (D) RX-Requests bedienen
-  if (ll.rfMode == Mode::Rx) {
+  if (rl.rfMode == Mode::Rx) {
     
     // check TX pending (especially for continuous RX)
-    if (ll.txPending) {
-      if (ll.rxKind == RxKind::Timed) {
-        const uint16_t delta = ll.rxCountFiltered - ll.rxCountWinStart;
+    if (rl.txPending) {
+      if (rl.rxKind == RxKind::Timed) {
+        const uint16_t delta = rl.rxCountFiltered - rl.rxCountWinStart;
         if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
       }
-      ll.rxKind = RxKind::None;
-      ll.rxWindowEndMs = 0;
-      ll.rxNumWanted = -1;
-      ll.rfMode = Mode::Idle; // Wechsel zu Tx ermöglichen
-      ll.radio->standby(); // Empfang sofort beenden, nicht erst wenn earliestTxAtMs erreicht ist
-      ll.changeMode = true;
+      rl.rxKind = RxKind::None;
+      rl.rxWindowEndMs = 0;
+      rl.rxNumWanted = -1;
+      rl.rfMode = Mode::Idle; // Wechsel zu Tx ermöglichen
+      rl.radio->standby(); // Empfang sofort beenden, nicht erst wenn earliestTxAtMs erreicht ist
+      rl.changeMode = true;
       return;
     }
 
     // RX-Window Timeout prüfen und ggf. beenden
-    if (ll.rxKind == RxKind::Timed && ll.rxWindowEndMs > 0) {
+    if (rl.rxKind == RxKind::Timed && rl.rxWindowEndMs > 0) {
       // RX-Timed: laufendes Fenster -> Fensterende prüfen
       
-      if ((int32_t)(now - ll.rxWindowEndMs) >= 0 || ll.rxNumWanted == 0) {
+      if ((int32_t)(now - rl.rxWindowEndMs) >= 0 || rl.rxNumWanted == 0) {
         // Fensterende erreicht oder alle Antworten empfangen
 
-        if(ll.lbtRxRelax && ll.rxNumWanted != 0) {
+        if(rl.lbtRxRelax && rl.rxNumWanted != 0) {
           // LBT Rx-Relax: RX fortsetzen bis seit dem letzten Paket länger als rxLbtTimeout ms vergangen sind
           // Ausnahme: wenn rxNumWanted==0 (alle Antworten empfangen)
-          const uint32_t deltaSinceLastRx = now - ll.lastRxAtMs;
-          if (deltaSinceLastRx < ll.rxLbtTimeout) {
+          const uint32_t deltaSinceLastRx = now - rl.lastRxAtMs;
+          if (deltaSinceLastRx < rl.rxLbtTimeout) {
             // noch nicht timeout
             return; // nichts tun, RX läuft weiter
           }
         }
 
-        ll.rfMode = Mode::Idle;
-        ll.reqRxKind = ll.defaultRxKind; // nach RX wieder in default modus wechseln
-        ll.reqRxMs   = ll.defaultRxMs;
-        ll.changeMode = true;
-        ll.rxWindowEndMs = 0;
-        ll.rxNumWanted = -1;
+        rl.rfMode = Mode::Idle;
+        rl.reqRxKind = rl.defaultRxKind; // nach RX wieder in default modus wechseln
+        rl.reqRxMs   = rl.defaultRxMs;
+        rl.changeMode = true;
+        rl.rxWindowEndMs = 0;
+        rl.rxNumWanted = -1;
         
-        const uint16_t delta = ll.rxCountFiltered - ll.rxCountWinStart;
+        const uint16_t delta = rl.rxCountFiltered - rl.rxCountWinStart;
         if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
 
         return; // fertig
@@ -705,38 +705,38 @@ inline void service(Core& ll, const Callbacks& cb) {
       return; // laufendes Fenster noch nicht beendet
     }
 
-    if (ll.changeMode) {
+    if (rl.changeMode) {
       // komme von Idle: Continous RX starten
-      if(ll.radio->startReceive() != RADIOLIB_ERR_NONE) {
+      if(rl.radio->startReceive() != RADIOLIB_ERR_NONE) {
         // RX nicht gestartet
         return; // fehler, wird im nächsten durchgang erneut versucht
       }
     }
 
-    if (ll.changeMode || ll.rxKind != ll.reqRxKind) {
+    if (rl.changeMode || rl.rxKind != rl.reqRxKind) {
       // von einem rx modus in einen anderen wechseln
 
-      if(ll.reqRxKind==RxKind::Timed) {
+      if(rl.reqRxKind==RxKind::Timed) {
         // setze rxWindowEndMs reqRxMs
         // bei LBT automatisch kürzeres rxWindow? -> bei scheduleSend entsprechend anpassen
-        ll.rxCountWinStart = ll.rxCountFiltered;
-        const uint16_t w = (ll.reqRxMs ? ll.reqRxMs : ll.defaultRxMs);
-        ll.rxWindowEndMs = now + w;
+        rl.rxCountWinStart = rl.rxCountFiltered;
+        const uint16_t w = (rl.reqRxMs ? rl.reqRxMs : rl.defaultRxMs);
+        rl.rxWindowEndMs = now + w;
         if (cb.onRxWindowOpen) cb.onRxWindowOpen(w, cb.ctx);
       }
-      else if(ll.reqRxKind==RxKind::Continuous) {
-        ll.rxWindowEndMs = 0;
+      else if(rl.reqRxKind==RxKind::Continuous) {
+        rl.rxWindowEndMs = 0;
         if (cb.onRxWindowOpen) cb.onRxWindowOpen(0, cb.ctx);
       }
-      ll.rxKind = ll.reqRxKind; // nach übernahme des neuen modus setzen
-      ll.changeMode = false; // mode change done
+      rl.rxKind = rl.reqRxKind; // nach übernahme des neuen modus setzen
+      rl.changeMode = false; // mode change done
     }
   }
 }
 
-} // namespace LoraLink
+} // namespace RaceLinkTransport
 
-#ifdef LL__RESTORE_RANDOM_MACRO_AFTER_RADIOLIB
+#ifdef RL__RESTORE_RANDOM_MACRO_AFTER_RADIOLIB
   #define random hw_random // replace arduino random()
-  #undef LL__RESTORE_RANDOM_MACRO_AFTER_RADIOLIB
+  #undef RL__RESTORE_RANDOM_MACRO_AFTER_RADIOLIB
 #endif
