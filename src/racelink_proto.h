@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// RaceLink protocol v1.1 -- shared, header-only protocol for ESP32 + SX1262
+// RaceLink protocol v2.0 -- shared, header-only protocol for SX1262 / LLCC68 based nodes
 // Packet = Header7 (3B sender + 3B receiver + 1B type) + Body (0..20B)
 // Direction bit (0x80): 0 = Master->Node, 1 = Node->Master
 // Broadcast: receiver3 == FF:FF:FF
@@ -22,8 +22,8 @@ enum RL_Dev_Type : uint8_t {
 namespace RaceLinkProto {
 
 // -------------------- Versioning --------------------
-static const uint8_t PROTO_VER_MAJOR = 1;
-static const uint8_t PROTO_VER_MINOR = 4;
+static const uint8_t PROTO_VER_MAJOR = 2;
+static const uint8_t PROTO_VER_MINOR = 0;
 
 // -------------------- Direction/Type helpers --------------------
 static const uint8_t DIR_M2N = 0x00;  // Master -> Node
@@ -65,25 +65,6 @@ struct __attribute__((packed)) P_Control     { uint8_t groupId; uint8_t flags; u
 struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t data0; uint8_t data1; uint8_t data2; uint8_t data3; }; // 5B
 struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; uint8_t ts24_2; uint8_t brightness; }; // 4B // 24-bit timestamp LSB first + bri
 struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];         }; // 9B
-
-struct StreamCtrl {
-  bool start;
-  bool stop;
-  uint8_t packets_left;
-};
-
-inline uint8_t encode_stream_ctrl(bool start, bool stop, uint8_t packets_left) {
-  uint8_t ctrl = (start ? 0x80U : 0x00U) | (stop ? 0x40U : 0x00U);
-  return static_cast<uint8_t>(ctrl | (packets_left & 0x3FU));
-}
-
-inline StreamCtrl decode_stream_ctrl(uint8_t ctrl) {
-  StreamCtrl decoded{};
-  decoded.start = (ctrl & 0x80U) != 0U;
-  decoded.stop = (ctrl & 0x40U) != 0U;
-  decoded.packets_left = static_cast<uint8_t>(ctrl & 0x3FU);
-  return decoded;
-}
 
 // Node -> Master
 //struct __attribute__((packed)) P_IdentifyReply { uint8_t proto_ver_major; uint8_t proto_ver_minor; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B
@@ -176,7 +157,7 @@ inline RespDecision decide_response(uint8_t in_type, uint8_t in_body_len) {
 
 // -------------------- Pack/Unpack helpers --------------------
 inline void put3(uint8_t dst[3], const uint8_t src[3]) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; }
-inline bool isBroadcast3(const uint8_t r3[3]) { return r3[0]==0xFF && r3[1]==0xFF && r3[2]==0xFF; } // TODO: auch weitere helper aus racelink_transport_core.h hierher oder alle helper nach racelink_transport_core.h verschieben?
+inline bool isBroadcast3(const uint8_t r3[3]) { return r3[0]==0xFF && r3[1]==0xFF && r3[2]==0xFF; } // TODO: put all helpers in racelink_transport_core.h or collect all here?
 
 inline bool parseHeader(const uint8_t* buf, uint8_t len, Header7& h) {
   if (len < sizeof(Header7)) return false;
@@ -209,6 +190,25 @@ inline uint8_t build_empty(uint8_t* out, const uint8_t s3[3], const uint8_t r3[3
   Header7* h = reinterpret_cast<Header7*>(out);
   put3(h->sender, s3); put3(h->receiver, r3); h->type = full_type;
   return (uint8_t)sizeof(Header7);
+}
+
+struct StreamCtrl {
+  bool start;
+  bool stop;
+  uint8_t packets_left;
+};
+
+inline uint8_t encode_stream_ctrl(bool start, bool stop, uint8_t packets_left) {
+  uint8_t ctrl = (start ? 0x80U : 0x00U) | (stop ? 0x40U : 0x00U);
+  return static_cast<uint8_t>(ctrl | (packets_left & 0x3FU));
+}
+
+inline StreamCtrl decode_stream_ctrl(uint8_t ctrl) {
+  StreamCtrl decoded{};
+  decoded.start = (ctrl & 0x80U) != 0U;
+  decoded.stop = (ctrl & 0x40U) != 0U;
+  decoded.packets_left = static_cast<uint8_t>(ctrl & 0x3FU);
+  return decoded;
 }
 
 } // namespace RaceLinkProto

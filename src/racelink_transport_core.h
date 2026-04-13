@@ -46,8 +46,8 @@ namespace RaceLinkTransport {
 struct PhyCfg {
   float   freqMHz      = 867.7f; //868.0f;
   float   bwKHz        = 125.0f;
-  uint8_t sf           = 7;     // LoRa spreading factor
-  uint8_t crDen        = 5;     // LoRa coding rate denominator (5 => 4/5)
+  uint8_t sf           = 7;     // RaceLink spreading factor
+  uint8_t crDen        = 5;     // RaceLink coding rate denominator (5 => 4/5)
   uint8_t syncWord     = 0x12;
   uint16_t preamble    = 8;
   bool    crcOn        = true;
@@ -85,9 +85,9 @@ enum class TxArbiter : uint8_t { None, CadNeeded, CadPending };
 // -------------------- Core state --------------------
 struct Core {
   
-  #if defined(GATE_LORA_SX1262)
+  #if defined(RACELINK_SX1262)
     SX1262*   radio             = nullptr;
-  #elif defined(GATE_LORA_LLCC68)
+  #elif defined(RACELINK_LLCC68)
     LLCC68*   radio             = nullptr;
   #else
     #error "No supported radio module defined"
@@ -446,10 +446,10 @@ inline StreamStatus handleStreamPacket(Core& rl, const RaceLinkProto::P_Stream& 
 }
 
 // -------------------- Radio initialization common code --------------------
-#if defined(GATE_LORA_SX1262)
+#if defined(RACELINK_SX1262)
 inline bool beginCommon(SX1262& radio, Core& rl, const PhyCfg& cfg) {
-#elif defined(GATE_LORA_LLCC68)
-inline bool beginCommon(rlCC68& radio, Core& rl, const PhyCfg& cfg) {
+#elif defined(RACELINK_LLCC68)
+inline bool beginCommon(LLCC68& radio, Core& rl, const PhyCfg& cfg) {
 #else
   #error "No supported radio module defined"
 #endif
@@ -478,16 +478,16 @@ inline bool beginCommon(rlCC68& radio, Core& rl, const PhyCfg& cfg) {
   return true;
 }
 
-#if defined(GATE_LORA_SX1262)
+#if defined(RACELINK_SX1262)
 inline void attachDio1(SX1262& radio, Core& rl) {
   radio.setDio1Action(onDio1ISR_trampoline);
 }
-#elif defined(GATE_LORA_LLCC68)
-inline void attachDio1(rlCC68& radio, Core& rl) {
+#elif defined(RACELINK_LLCC68)
+inline void attachDio1(LLCC68& radio, Core& rl) {
   radio.setDio1Action(onDio1ISR_trampoline);
 }
 #else
-#error "No LoRa radio module defined"
+#error "No RaceLink radio module defined"
 #endif
 
 // -------------------- The service pump (call in loop()) --------------------

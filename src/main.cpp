@@ -20,11 +20,11 @@ static RaceLinkTransport::Callbacks cb{};
 /************ LoRa PHY ************/
 #define RF_FREQUENCY_HZ             867700000UL //868000000UL
 #define TX_OUTPUT_POWER             14           // dBm
-#define LORA_BW_KHZ                 125.0        // 0 => 125 kHz -> 125.0 in RadioLib
-#define LORA_SF                     7            // SF7
-#define LORA_CR_DEN                 5            // 4/5 -> 5
-#define LORA_PREAMBLE               8
-#define LORA_SYNCWORD               0x12
+#define RACELINK_BW_KHZ                 125.0        // 0 => 125 kHz -> 125.0 in RadioLib
+#define RACELINK_SF                     7            // SF7
+#define RACELINK_CR_DEN                 5            // 4/5 -> 5
+#define RACELINK_PREAMBLE               8
+#define RACELINK_SYNCWORD               0x12
 
 /************ USB Link ************/
 #define BAUDRATE        921600
@@ -47,26 +47,26 @@ void IRAM_ATTR isr_button() { btnFallingFlag = true; }
 #ifndef PIN_VEXT
   #error "Define PIN_VEXT in platformio.ini build_flags"
 #endif
-#ifndef LORA_CS
-  #error "Define LORA_CS in platformio.ini build_flags"
+#ifndef RACELINK_CS
+  #error "Define RACELINK_CS in platformio.ini build_flags"
 #endif
-#ifndef LORA_DIO1
-  #error "Define LORA_DIO1 in platformio.ini build_flags"
+#ifndef RACELINK_DIO1
+  #error "Define RACELINK_DIO1 in platformio.ini build_flags"
 #endif
-#ifndef LORA_BUSY
-  #error "Define LORA_BUSY in platformio.ini build_flags"
+#ifndef RACELINK_BUSY
+  #error "Define RACELINK_BUSY in platformio.ini build_flags"
 #endif
-#ifndef LORA_RST
-  #error "Define LORA_RST in platformio.ini build_flags"
+#ifndef RACELINK_RST
+  #error "Define RACELINK_RST in platformio.ini build_flags"
 #endif
-#ifndef LORA_SCK
-  #error "Define LORA_SCK in platformio.ini build_flags"
+#ifndef RACELINK_SCK
+  #error "Define RACELINK_SCK in platformio.ini build_flags"
 #endif
-#ifndef LORA_MISO
-  #error "Define LORA_MISO in platformio.ini build_flags"
+#ifndef RACELINK_MISO
+  #error "Define RACELINK_MISO in platformio.ini build_flags"
 #endif
-#ifndef LORA_MOSI
-  #error "Define LORA_MOSI in platformio.ini build_flags"
+#ifndef RACELINK_MOSI
+  #error "Define RACELINK_MOSI in platformio.ini build_flags"
 #endif
 #ifndef OLED_SDA
   #error "Define OLED_SDA in platformio.ini build_flags"
@@ -279,7 +279,7 @@ void drawDebug(const uint8_t* buf, uint8_t len) {
 
 /************ RadioLib: Modul + ISR-Flags ************/
 SX1262 radio = SX1262(new Module(
-  LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, 
+  RACELINK_CS, RACELINK_DIO1, RACELINK_RST, RACELINK_BUSY, 
   SPI, SPISettings(8000000, MSBFIRST, SPI_MODE0)
 ));
 
@@ -558,15 +558,15 @@ static inline void usb_forward_transport(const uint8_t* pkt, uint8_t len, int16_
 
 /************ RaceLink transport init (RadioLib) ************/
 void transport_init() {
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  SPI.begin(RACELINK_SCK, RACELINK_MISO, RACELINK_MOSI, RACELINK_CS);
 
   RaceLinkTransport::PhyCfg phy;
   phy.freqMHz   = (float)RF_FREQUENCY_HZ / 1e6f;
-  phy.bwKHz     = LORA_BW_KHZ;
-  phy.sf        = LORA_SF;
-  phy.crDen     = LORA_CR_DEN;
-  phy.syncWord  = LORA_SYNCWORD;
-  phy.preamble  = LORA_PREAMBLE;
+  phy.bwKHz     = RACELINK_BW_KHZ;
+  phy.sf        = RACELINK_SF;
+  phy.crDen     = RACELINK_CR_DEN;
+  phy.syncWord  = RACELINK_SYNCWORD;
+  phy.preamble  = RACELINK_PREAMBLE;
   phy.crcOn     = true;
 
   // Gerätespezifische Overrides (wie bisher im Master):
