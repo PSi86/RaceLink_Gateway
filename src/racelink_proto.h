@@ -62,6 +62,7 @@ enum Opcode7 : uint8_t {
   OPC_STREAM        = 0x07, // STREAM_M2N (M2N)
   OPC_CONTROL       = 0x08, // CONTROL (M2N) -- variable-length direct effect params (see layout below)
   OPC_OFFSET        = 0x09, // OFFSET (M2N) -- per-group offset_ms snapshot used by ARM_ON_SYNC + OFFSET_MODE controls
+  OPC_GET_CONFIG    = 0x0A, // GET_CONFIG (M2N, 1B body=option) -> reply: same opcode N2M, body=P_Config (5B). Read-back of OPC_CONFIG-style options so the host can detect device-vs-host divergence on dialog open.
   OPC_ACK           = 0x7E, // ACK (both directions, as response only)
   // Phase-D rename (2026-04-25): opcode values are invariant, only the
   // identifiers shifted: OPC_CONTROL -> OPC_PRESET (0x04), OPC_CONTROL_ADV
@@ -76,6 +77,14 @@ struct __attribute__((packed)) P_SetGroup    { uint8_t groupId;                 
 struct __attribute__((packed)) P_GetStatus   { uint8_t groupId; uint8_t flags;        }; // 2B
 struct __attribute__((packed)) P_Preset      { uint8_t groupId; uint8_t flags; uint8_t presetId; uint8_t brightness; }; // 4B (OPC_PRESET; add palette later?)
 struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t data0; uint8_t data1; uint8_t data2; uint8_t data3; }; // 5B
+// OPC_GET_CONFIG body — request to read one option's current device-side
+// value. Reply uses the same opcode (N2M direction bit flipped) with a
+// P_Config-shaped 5B body; ``data0..3`` carry the live value packed
+// per-option in the same little-endian layout as the OPC_CONFIG write
+// commands (uint8 / uint16 LE / uint16-pair). Unknown / write-only
+// options (0x02 ClearMaster, 0x0F ClearAll, 0x81 Reboot, etc.) produce
+// no reply; the host treats that as a timeout.
+struct __attribute__((packed)) P_GetConfig   { uint8_t option;                       }; // 1B
 // OPC_SYNC body. Wire length is 4B (legacy clock-tick form) or 5B
 // (flag-bearing form). The 5th byte is `flags`; bit 0 =
 // SYNC_FLAG_TRIGGER_ARMED. The device adjusts its timebase on every SYNC
@@ -268,6 +277,7 @@ struct __attribute__((packed)) P_Ack { uint8_t echo_opcode7; uint8_t status; uin
 
 static_assert(sizeof(P_Preset) <= BODY_MAX, "P_Preset too large");
 static_assert(sizeof(P_Config) <= BODY_MAX, "P_Config too large");
+static_assert(sizeof(P_GetConfig) <= BODY_MAX, "P_GetConfig too large");
 static_assert(sizeof(P_Sync) <= BODY_MAX, "P_Sync too large");
 static_assert(sizeof(P_Stream) <= BODY_MAX, "P_Stream too large");
 static_assert(sizeof(P_IdentifyReply) <= BODY_MAX, "P_IdentifyReply too large");
@@ -316,6 +326,12 @@ static constexpr PacketRule RULES[] = {
   { OPC_OFFSET,     DIR_M2N, RESP_NONE,     0,           0 /*variable*/,      0,                     "OFFSET" },
   // OPC_STREAM: STREAM_M2N (M2N, 9B) -> ACK (only last packet in stream)
   { OPC_STREAM,     DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_Stream>(),      SZ<P_Ack>(),           "STREAM_M2N" },
+  // OPC_GET_CONFIG: read-back of an OPC_CONFIG-style option (M2N, 1B body=option)
+  // -> reply: same opcode with N2M direction bit, body=P_Config (5B) carrying
+  // option + data0..3 packed per the matching write command's layout. Used by
+  // the host's "Device Options" dialog to detect host-vs-device divergence on
+  // open; absent reply means "device does not expose this option for read".
+  { OPC_GET_CONFIG, DIR_M2N, RESP_SPECIFIC, OPC_GET_CONFIG, SZ<P_GetConfig>(), SZ<P_Config>(),       "GET_CONFIG" },
 };
 
 // Lookup by 7-bit opcode

@@ -806,6 +806,21 @@ void handleCommand() {
         }
       } break;
 
+      case RaceLinkProto::OPC_GET_CONFIG: {
+        // Read-back of an OPC_CONFIG-style option. Body is 1 byte (the
+        // option to read). Reply (N2M, opcode 0x0A) reuses the P_Config
+        // 5-byte body and is forwarded to USB by the standard transport
+        // path (usb_forward_transport) without any opcode-specific code
+        // here -- the gateway treats every N2M frame the same way.
+        if (bodyLen == sizeof(RaceLinkProto::P_GetConfig)) {
+          RaceLinkProto::P_GetConfig p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
       case RaceLinkProto::OPC_SYNC: {
         // Host triggers a global SYNC NOW (broadcast). Body is variable: 4 B
         // legacy clock-tick form, or 5 B with a trailing SYNC_FLAG_* byte.
