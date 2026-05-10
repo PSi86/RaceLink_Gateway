@@ -12,6 +12,33 @@
 static RaceLinkTransport::Core rl{};
 static RaceLinkTransport::Callbacks cb{};
 
+// -------------------- Multithreading globals (Batch C, 2026-05-10) --------------------
+// The gateway runs four FreeRTOS tasks:
+//   * rl-display  (Core 0) — OLED renderer; pre-existing.
+//   * rl-usb-tx   (Core 0) — drains g_usbTxQ → Serial.write. Single writer to Serial.
+//   * rl-usb-rx   (Core 0) — recvSerialBytes() + button polling. Pushes complete
+//                            host frames onto g_hostCmdQ.
+//   * rl-radio    (Core 1) — sole owner of `rl`, SX1262 SPI, the TX/RX state
+//                            machine, command processing, and auto-SYNC. Woken
+//                            by DIO1 ISR notification and by cross-task notifies
+//                            from rl-usb-rx when a host frame lands.
+// Single-owner discipline replaces every mutex: rl-radio is the only task that
+// touches `rl`. Inter-task data crosses via two FreeRTOS queues. The display
+// path retains its existing portMUX + notify primitives.
+struct UsbTxItem   { uint8_t buf[40]; uint8_t len; };
+struct HostCmdItem { uint8_t buf[36]; uint8_t len; };
+
+static QueueHandle_t g_usbTxQ      = nullptr;   // radio/cmd → rl-usb-tx, 16 slots
+static QueueHandle_t g_hostCmdQ    = nullptr;   // rl-usb-rx → rl-radio,  4 slots
+static TaskHandle_t  g_radioTask   = nullptr;   // DIO1 ISR / rl-usb-rx wake target
+static TaskHandle_t  g_usbTxTask   = nullptr;
+static TaskHandle_t  g_usbRxTask   = nullptr;
+
+// Drop counters: queue overflow means we lost telemetry, not radio work. Kept
+// for future EV_ERROR telemetry; not currently surfaced.
+static volatile uint32_t g_usbTxDropCount   = 0;
+static volatile uint32_t g_hostCmdDropCount = 0;
+
 #include <SPI.h>
 #include <Wire.h>
 //#include <RadioLib.h>     // SX1262
@@ -86,38 +113,43 @@ void IRAM_ATTR isr_button() { btnFallingFlag = true; }
 //   EV_TX_REJECTED (0xF4), EV_STATE_REPORT (0xF5).
 // Host->Device commands: GW_CMD_IDENTIFY (0x01), GW_CMD_STATE_REQUEST (0x7F).
 
+// Push raw bytes onto g_usbTxQ for rl-usb-tx to write to Serial. Non-blocking:
+// on a full queue we drop the item and bump g_usbTxDropCount — telemetry loss
+// is preferable to stalling the RF callback path on USB-CDC throughput. Pre-
+// queue this was a direct Serial.write() in radio-callback context on Core 1,
+// which could block ~10 ms per coalesced frame and back-pressure the loop into
+// missing the next DIO1 IRQ.
+static inline void usb_tx_enqueue_raw(const uint8_t* data, uint8_t len) {
+  if (!g_usbTxQ || !data || !len) return;
+  UsbTxItem it;
+  if (len > sizeof(it.buf)) len = sizeof(it.buf);
+  memcpy(it.buf, data, len);
+  it.len = len;
+  if (xQueueSend(g_usbTxQ, &it, 0) != pdTRUE) {
+    g_usbTxDropCount++;
+  }
+}
+
 static inline void usb_send_frame(uint8_t type, const uint8_t* data, uint8_t len) {
-  // Coalesce the 4 logical writes (SOF, LEN, TYPE, DATA) into a single
-  // Serial.write call. Pre-coalesce each logical write was a separate
-  // call; on USB-CDC the host's bridge chip (CP210x / FTDI) sees them as
-  // distinct USB transactions and may stall up to its latency_timer
-  // (default 16 ms) waiting for "more data" before flushing each one.
-  // Single-buffer write keeps the whole frame in one USB packet so the
-  // host receives it in one read syscall — saves ~2-5 ms per event on
-  // the device → host path. Combined with the host-side
-  // set_low_latency_mode(True) and chunked _reader read this brings the
-  // per-packet wall-clock overhead from ~25 ms to <10 ms.
+  // Build the framed packet [0x00][LEN][TYPE][DATA...] into a stack buffer and
+  // hand it to rl-usb-tx via g_usbTxQ. The coalescing rationale (one USB-CDC
+  // transaction per frame, avoid the host bridge's 16 ms latency_timer) is
+  // preserved: rl-usb-tx issues exactly one Serial.write(it.buf, it.len) per
+  // queue item.
   //
   // Frame size is bounded: max event body in this gateway is ~32 bytes
-  // (a forwarded N2M packet with RSSI/SNR), so a 36-byte stack buffer is
-  // generous. The original per-byte writes had no size cap, but the
-  // current callers all stay well under this limit.
-  uint8_t buf[36];
-  if (len > sizeof(buf) - 3) {
-    // Defensive fallback for an oversized event (shouldn't happen with
-    // current callers): preserve the legacy per-write behaviour so the
-    // frame still goes out, just with the latency hit.
-    Serial.write((uint8_t)0x00);
-    Serial.write((uint8_t)(1 + len));
-    Serial.write(type);
-    if (len) Serial.write(data, len);
+  // (a forwarded N2M packet with RSSI/SNR), so a 40-byte queue slot is
+  // generous. Oversized callers are dropped + counted — none today.
+  if (len > 40 - 3) {
+    g_usbTxDropCount++;
     return;
   }
-  buf[0] = 0x00;            // SOF
+  uint8_t buf[40];
+  buf[0] = 0x00;               // SOF
   buf[1] = (uint8_t)(1 + len); // LEN = TYPE + DATA bytes
   buf[2] = type;
   if (len) memcpy(&buf[3], data, len);
-  Serial.write(buf, (size_t)(3 + len));
+  usb_tx_enqueue_raw(buf, (uint8_t)(3 + len));
 }
 
 static inline void usb_send_event_u8(uint8_t evType, uint8_t v) {
@@ -242,38 +274,34 @@ uint8_t myLast3[3] = {0};
 bool macReadOK = false;
  */
 /************ Serial Handling (dein Parser) ************/
-const byte maxBytes = 255;
-byte receivedBytes[maxBytes];
-byte numReceived = 0;
-bool newSerialData = false;
-
 // Robust serial frame receiver for framing: [0x00][LEN][TYPE][DATA...]
-// LEN = number of bytes following LEN (TYPE + DATA)
+// LEN = number of bytes following LEN (TYPE + DATA). On a complete frame the
+// receiver pushes a HostCmdItem onto g_hostCmdQ and notifies rl-radio.
+// Pre-refactor this set the global newSerialData flag for the Arduino loop()
+// to drain — that mechanism is gone; the queue + notify is the sole signal.
 const uint16_t FRAG_TIMEOUT_MS = 25;   // 10–30 ms sind praxisnah bei 921600 Baud
 
 void recvSerialBytes() {
   static bool     recvInProgress = false;
-  static uint8_t  ndx            = 0;     // how many bytes stored in receivedBytes (incl. LEN)
-  static uint8_t  dataLen        = 0;     // LEN byte value (TYPE+DATA bytes expected)
+  static uint8_t  ndx            = 0;                       // bytes stored in frameBuf incl. LEN
+  static uint8_t  dataLen        = 0;                       // LEN byte value (TYPE+DATA expected)
   static uint32_t lastByteAtMs   = 0;
+  static uint8_t  frameBuf[sizeof(HostCmdItem::buf)];        // local accumulator → queue slot
 
-  // Timeout auch dann prüfen, wenn gerade keine Bytes anliegen:
-  if (recvInProgress && !newSerialData) {
+  // Fragment-Timeout auch ohne ankommende Bytes prüfen.
+  if (recvInProgress) {
     uint32_t now = millis();
     if ((uint32_t)(now - lastByteAtMs) > FRAG_TIMEOUT_MS && Serial.available() == 0) {
-      // Fragment verworfen (Timeout)
       recvInProgress = false;
       ndx = 0; dataLen = 0;
-      // optionales Telemetrie-/Log-Event:
-      // usb_send_event_u16(EV_ERROR, 3); // 3 = TIMEOUT
+      // usb_send_event_u16(EV_ERROR, 3); // 3 = TIMEOUT (optional)
     }
   }
 
-  while (Serial.available() > 0 && !newSerialData) {
+  while (Serial.available() > 0) {
     uint8_t rb = (uint8_t)Serial.read();
     lastByteAtMs = millis();
 
-    // Noch kein Frame aktiv -> warte auf Header 0x00
     if (!recvInProgress) {
       if (rb == 0x00) {
         recvInProgress = true;
@@ -283,39 +311,43 @@ void recvSerialBytes() {
       continue;  // alles andere ignorieren bis zum nächsten 0x00
     }
 
-    // Wir sind in einem Frame:
     if (ndx == 0) {
-      // Erstes Byte nach 0x00 ist LEN (TYPE+DATA)
       dataLen = rb;
-      if (dataLen == 0 || dataLen > (maxBytes - 1)) {
-        // Ungültige Länge -> Frame verwerfen und auf nächsten Header warten
+      if (dataLen == 0 || dataLen > (uint8_t)(sizeof(frameBuf) - 1)) {
         recvInProgress = false;
         ndx = 0; dataLen = 0;
         // usb_send_event_u16(EV_ERROR, 1); // 1 = LEN_INVALID
         continue;
       }
-      receivedBytes[ndx++] = dataLen;  // LEN in [0] ablegen; TYPE folgt als nächstes
+      frameBuf[ndx++] = dataLen;
       continue;
     }
 
-    // TYPE/DATA aufnehmen
-    if (ndx < maxBytes) {
-      receivedBytes[ndx++] = rb;
+    if (ndx < sizeof(frameBuf)) {
+      frameBuf[ndx++] = rb;
     } else {
-      // Pufferüberlauf -> Frame verwerfen
       recvInProgress = false;
       ndx = 0; dataLen = 0;
       // usb_send_event_u16(EV_ERROR, 2); // 2 = OVERRUN
       continue;
     }
 
-    // Abschluss: genau wenn LEN + 1 Bytes (inkl. LEN) gelesen wurden
     if (ndx == (uint16_t)dataLen + 1) {
-      numReceived    = ndx;        // enthält LEN + TYPE + DATA
-      newSerialData  = true;       // signalisiert Main-Loop: Frame liegt in receivedBytes
+      // Komplettes Frame: in HostCmdItem packen und an rl-radio übergeben.
+      HostCmdItem item;
+      item.len = ndx;
+      memcpy(item.buf, frameBuf, ndx);
+      if (g_hostCmdQ) {
+        if (xQueueSend(g_hostCmdQ, &item, 0) != pdTRUE) {
+          g_hostCmdDropCount++;
+        } else if (g_radioTask) {
+          // Radio-Task sofort wecken statt auf die 10 ms-Periode zu warten.
+          xTaskNotifyGive(g_radioTask);
+        }
+      }
       recvInProgress = false;
       ndx = 0; dataLen = 0;
-      // while-Bedingung bricht hier ab (wegen !newSerialData), damit ein Frame pro Loop verarbeitet wird
+      return;  // ein Frame pro Aufruf — Aufrufer ruft uns periodisch (5 ms-Tick).
     }
   }
 }
@@ -524,9 +556,22 @@ static inline void requestDebugRedraw(const uint8_t* buf, uint8_t len) {
 
 /************ RadioLib: Modul + ISR-Flags ************/
 SX1262 radio = SX1262(new Module(
-  RACELINK_CS, RACELINK_DIO1, RACELINK_RST, RACELINK_BUSY, 
+  RACELINK_CS, RACELINK_DIO1, RACELINK_RST, RACELINK_BUSY,
   SPI, SPISettings(8000000, MSBFIRST, SPI_MODE0)
 ));
+
+// Gateway-eigene DIO1-ISR: setzt zusätzlich zur (Bestand-)dio1Flag eine
+// Task-Notification an rl-radio ab, damit der Radio-Task ohne 10 ms-Tick-
+// Latenz auf TX-Done / RX-Pakete reagiert. Bewusst nicht in
+// racelink_transport_core.h verdrahtet — der Header wird mit der WLED-Node-
+// Firmware geteilt und bleibt unverändert. Statt RaceLinkTransport::attachDio1
+// ruft transport_init() radio.setDio1Action(gateway_dio1_isr) direkt auf.
+static void IRAM_ATTR gateway_dio1_isr() {
+  rl.dio1Flag = true;
+  BaseType_t hpw = pdFALSE;
+  if (g_radioTask) vTaskNotifyGiveFromISR(g_radioTask, &hpw);
+  portYIELD_FROM_ISR(hpw);
+}
 
 
 /************ SYNC (Master-side) ************/
@@ -650,12 +695,14 @@ static bool transportInDefaultIdleState(const RaceLinkTransport::Core& rl) {
 }
 
 // Auto-SYNC should only be sent when nothing else is happening.
+// Pre-refactor this checked newSerialData + Serial.available() to gate against
+// in-flight host work on Core 1. Post-refactor rl-usb-rx (Core 0) drains
+// Serial into g_hostCmdQ, so a non-empty queue is the right idle gate.
+// Serial.available() can't be reliably read from rl-radio's core; the queue
+// check covers all host-side intent without cross-core peripheral access.
 static bool idleForAutoSync(const RaceLinkTransport::Core& rl) {
-  // USB work pending?
-  if (newSerialData) return false;
-  if (Serial.available() > 0) return false;
+  if (g_hostCmdQ && uxQueueMessagesWaiting(g_hostCmdQ) > 0) return false;
 
-  // Link busy?
   if (rl.txPending) return false;
   return transportInDefaultIdleState(rl);
 }
@@ -697,20 +744,32 @@ static void sync_service(RaceLinkTransport::Core& rl) {
 }
 
 /************ Host-Kommandos (1:1) ************/
-void handleCommand() {
-  if (!newSerialData) return;
+// Pre-refactor this read the global receivedBytes / newSerialData pair set by
+// the Arduino loop()'s recvSerialBytes() pass. Now rl-radio drains g_hostCmdQ
+// and calls handleCommand(frame, len) directly — the globals are gone.
+// `frame` layout: [0]=LEN (= TYPE+DATA byte count), [1]=TYPE, [2..]=DATA.
+// `len` is total bytes (= LEN + 1).
+void handleCommand(const uint8_t* frame, uint8_t len) {
+  if (len < 2) return;
 
-  const uint8_t payloadLen = receivedBytes[0];
-  if (payloadLen < 1) { newSerialData = false; return; }
-  const uint8_t firstByte = receivedBytes[1];
+  const uint8_t payloadLen = frame[0];
+  if (payloadLen < 1) return;
+  if ((uint16_t)payloadLen + 1u > (uint16_t)len) return;
+  const uint8_t firstByte = frame[1];
 
-  // IDENTIFY (for port discovery)
+  // IDENTIFY (for port discovery). Reply is raw text (DEV_TYPE_STR + MAC) —
+  // not a framed event — so it goes through usb_tx_enqueue_raw rather than
+  // usb_send_frame. The host parser keys on the SOF (0x00) of subsequent
+  // events to resync, so a leading non-framed string is fine.
   if (payloadLen == 1 && firstByte == RaceLinkProto::GW_CMD_IDENTIFY) {
     char macstr[18];
     RaceLinkTransport::mac6ToStr(rl.myMac6, macstr);
-    Serial.print(F(DEV_TYPE_STR));
-    Serial.print(macstr);
-    newSerialData = false;
+    uint8_t out[40];
+    size_t n = 0;
+    const char* dev = DEV_TYPE_STR;
+    while (*dev && n < sizeof(out)) out[n++] = (uint8_t)*dev++;
+    for (size_t i = 0; i < 17 && n < sizeof(out); ++i) out[n++] = (uint8_t)macstr[i];
+    usb_tx_enqueue_raw(out, (uint8_t)n);
     return;
   }
 
@@ -719,16 +778,15 @@ void handleCommand() {
   // reconnect, and from the master-pill ↻ refresh button.
   if (payloadLen == 1 && firstByte == RaceLinkProto::GW_CMD_STATE_REQUEST) {
     emit_state_report();
-    newSerialData = false;
     return;
   }
 
   // New framing: TYPE_FULL + recv3 + body...
   if ((firstByte & 0x80) == RaceLinkProto::DIR_M2N && payloadLen >= 4) {
     const uint8_t type_full = firstByte;
-    const uint8_t recv3[3] = { receivedBytes[2], receivedBytes[3], receivedBytes[4] };
+    const uint8_t recv3[3] = { frame[2], frame[3], frame[4] };
     const uint8_t bodyLen = (uint8_t)(payloadLen - 4);
-    const uint8_t* body   = &receivedBytes[5];
+    const uint8_t* body   = &frame[5];
 
     uint8_t out[32]; uint8_t n = 0;
 
@@ -896,12 +954,10 @@ void handleCommand() {
       } break;
 
     }
-    newSerialData = false;
     return;
   }
 
   // Fallback: ignore
-  newSerialData = false;
 }
 
 /************ RaceLink transport to USB forwarding ************/
@@ -964,8 +1020,13 @@ void transport_init() {
   // ~1 s host-command latency: the cap was masking the 50-2500 ms jitter
   // default that try_schedule_or_nack used to inherit.
   rl.lbtEnable = false;   // gateway-side default, distinct from the Core struct's default of true
-  
-  RaceLinkTransport::attachDio1(radio, rl);
+
+  // DIO1-ISR wird NICHT hier verdrahtet — setup() ruft radio.setDio1Action(
+  // gateway_dio1_isr) erst NACH dem Spawnen der Tasks auf, damit die ISR ab
+  // dem ersten Edge eine gültige g_radioTask-Handle vorfindet. Bewusst NICHT
+  // RaceLinkTransport::attachDio1(): die Default-Trampoline würde nur
+  // rl.dio1Flag setzen, ohne den Task zu notifizieren — das wäre der alte
+  // Poll-Pfad. Unsere ISR macht beides.
   RaceLinkTransport::setDefaultRxContinuous(rl);
 }
 
@@ -1039,15 +1100,144 @@ static void on_idle_cb(void* ctx) {
   requestDisplayRedraw();
 }
 
+/************ Task bodies (Batch C, 2026-05-10) ************/
+
+// -------------------- rl-usb-tx (Core 0) --------------------
+// Sole writer to `Serial`. Pre-refactor every event/forward call
+// Serial.write() inline from radio-callback context on Core 1 — that could
+// block ~10 ms on USB-CDC throughput per coalesced frame and stall the next
+// DIO1 service. Now those callers enqueue 40-byte items into g_usbTxQ and
+// this task drains them on Core 0, decoupled from the RF hot path.
+//
+// Disconnect handling: `if (Serial)` checks the USB-CDC DTR state. When the
+// host detaches we silently drop draining items (the queue fills upstream
+// and increments g_usbTxDropCount). On reattach we resume immediately —
+// future events go through; we deliberately don't replay buffered items.
+static void usbTxTaskFn(void*) {
+  UsbTxItem it;
+  for (;;) {
+    if (xQueueReceive(g_usbTxQ, &it, portMAX_DELAY) == pdTRUE) {
+      if (Serial) {
+        Serial.write(it.buf, it.len);
+      }
+      // Bei nicht verbundenem Host: stillschweigend droppen.
+    }
+  }
+}
+
+// -------------------- Button polling helper (used by rl-usb-rx) --------------
+// 1:1 the logic of the pre-refactor loop() button block (lines 1136-1171).
+// Runs on Core 0 in the rl-usb-rx 5 ms tick. The ISR (isr_button) still fires
+// on whichever core's GPIO peripheral edge-triggers — `digitalRead()` and
+// `attachInterrupt()` are core-agnostic on ESP32-S3.
+// showDebug/inhibitStatusDraw: pre-refactor both were written from Core 1 and
+// read by the display task on Core 0. Now writes happen on Core 0 too
+// (single-core single-writer for the toggle), strictly safer than before.
+static void button_poll_step() {
+  if (btnFallingFlag) {
+    btnFallingFlag = false;
+    pressStartMs = millis();
+    longHandled = false;
+  }
+  if (pressStartMs != 0) {
+    bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+    unsigned long now = millis();
+    if (pressed && !longHandled && (now - pressStartMs) >= 1000) {
+      longHandled = true;
+      showDebug = !showDebug;
+      if (!showDebug) {
+        inhibitStatusDraw = false;
+        requestDisplayRedraw();
+      }
+    }
+    if (!pressed) {
+      if (!longHandled && (now - pressStartMs) >= 30) {
+        inhibitStatusDraw = false;
+        requestDisplayRedraw();
+      }
+      pressStartMs = 0;
+      longHandled  = false;
+    }
+  }
+}
+
+// -------------------- rl-usb-rx (Core 0) --------------------
+// Drains incoming USB-CDC bytes into g_hostCmdQ and runs the button-poll
+// step. Arduino HardwareSerial has no blocking-on-byte primitive, so we
+// poll at a 1 ms cadence (= FreeRTOS tick). Pre-refactor loop() polled
+// every iteration with no sleep — effectively continuous. A 1 ms tick is
+// close enough that host-side latency regressions are <1 ms (vs. the
+// initial 5 ms tick which added ~2.5 ms avg to every host command).
+// Button thresholds (30 ms short / 1000 ms long) are well above 1 ms.
+// CPU cost: ~1000 wakes/s × ~µs each = negligible on Core 0.
+static void usbRxTaskFn(void*) {
+  for (;;) {
+    recvSerialBytes();        // pushes complete frames + notifies rl-radio
+    button_poll_step();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+// -------------------- rl-radio (Core 1) --------------------
+// Sole owner of `rl`, the SX1262 SPI bus, and all radio state. Woken by
+// (a) the DIO1 ISR notify on TX-done / RX-packet-ready, and (b) rl-usb-rx
+// when it pushes a host frame onto g_hostCmdQ. The 10 ms timeout drives
+// time-gated state transitions that have no IRQ source — LBT backoff
+// (`earliestTxAtMs`), RX-window timeouts (`rxWindowEndMs`), and the
+// auto-SYNC 30 s gate.
+//
+// **Inner service loop (Batch C latency fix, 2026-05-10):**
+// RaceLinkTransport::service() returns early after every internal state
+// transition (Rx→Idle, Idle→Tx, Tx→standby→transmit→Idle, Idle→Rx).
+// Pre-refactor Arduino loop() pumped these back-to-back within microseconds
+// because loop() had no sleep. Calling service() exactly once per wake
+// here added a 10 ms notification-wait between every transition,
+// accumulating 20–30 ms per host-command round-trip (host observed
+// ~20 ms regression). Loop service() while `rl.changeMode` says more
+// transitions are pending; service() is cheap (a few register reads)
+// when nothing is happening, and rl.changeMode is the natural fixed-point
+// signal from the state machine itself. The cap of 8 is well above the
+// longest legitimate chain (Rx→Idle→Tx→standby→transmit→Idle→Rx ≈ 6).
+static void radioTaskFn(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+
+    // 1) Hostkommandos drainieren. Mehrere Frames pro Wake OK —
+    //    handleCommand ist günstig; scheduleSend serialisiert sich selbst
+    //    über rl.txPending. Vor service(), damit ein gerade angekommener
+    //    Befehl in dieser Wake gleich die State-Machine treibt.
+    HostCmdItem cmd;
+    while (xQueueReceive(g_hostCmdQ, &cmd, 0) == pdTRUE) {
+      handleCommand(cmd.buf, cmd.len);
+    }
+
+    // 2) Radio state machine bis zum Fixpunkt pumpen (siehe oben).
+    for (int i = 0; i < 8; ++i) {
+      RaceLinkTransport::service(rl, cb);
+      if (!rl.changeMode) break;
+    }
+
+    // 3) Auto-SYNC: 30 s-Tor, gated über idleForAutoSync(rl).
+    sync_service(rl);
+  }
+}
+
 /************ Setup/Loop ************/
 void setup() {
   Serial.begin(BAUDRATE);
   delay(50);
 
+  // Queues VOR jedem Aufruf von usb_send_frame/setGatewayState anlegen, sonst
+  // gehen frühe Boot-Events (z. B. das initiale EV_STATE_CHANGED(IDLE)) ins
+  // Leere. Consumer-Task wird später gespawnt; bis dahin füllt sich die Queue
+  // unkritisch auf — 16 Slots reichen für jede plausible Boot-Sequenz.
+  g_usbTxQ   = xQueueCreate(16, sizeof(UsbTxItem));
+  g_hostCmdQ = xQueueCreate(4,  sizeof(HostCmdItem));
+
   // Vext einschalten
   pinMode(PIN_VEXT, OUTPUT); // Vext Pin als Output
   digitalWrite(PIN_VEXT, LOW);   // LOW => Vext ON
-  
+
   // Button
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(BUTTON_PIN, isr_button, FALLING);
@@ -1124,49 +1314,33 @@ void setup() {
     &g_displayTask,          // handle (used by request* helpers)
     0                        // pin to Core 0 (PRO_CPU)
   );
+
+  // -------------------- I/O tasks on Core 0 (PRO_CPU) --------------------
+  // Priorität 4: bewusst eine Stufe unter TinyUSB (Prio 5 auf Arduino-ESP32),
+  // damit der USB-Stack-Pumpe immer Vorrang hat. Stack 2 KB reicht — beide
+  // Tasks haben minimale Lokal-Locals (HardwareSerial-Aufruftiefe ~600 B).
+  xTaskCreatePinnedToCore(usbTxTaskFn, "rl-usb-tx", 2048, nullptr, 4, &g_usbTxTask, 0);
+  xTaskCreatePinnedToCore(usbRxTaskFn, "rl-usb-rx", 2048, nullptr, 4, &g_usbRxTask, 0);
+
+  // -------------------- Radio task on Core 1 (APP_CPU) -------------------
+  // Hohe Priorität (configMAX_PRIORITIES-2 = 23 bei Arduino-ESP32-Default 25)
+  // damit der RF-State-Machine-Tick deterministisch reagiert. Stack 8 KB
+  // deckt RadioLib-Aufrufketten (scanChannel → transmit → SPItransfer) plus
+  // handleCommand-Locals (out[32], P_*-Structs) mit Sicherheitsmarge ab.
+  xTaskCreatePinnedToCore(radioTaskFn, "rl-radio", 8192, nullptr,
+                          configMAX_PRIORITIES - 2, &g_radioTask, 1);
+
+  // DIO1-ISR JETZT verdrahten — g_radioTask ist gesetzt, ab der ersten
+  // RX/TX-Flanke notifiziert die ISR ohne Race. Bewusst nach den
+  // Task-Creates und nicht in transport_init().
+  radio.setDio1Action(gateway_dio1_isr);
 }
 
+// Arduino-Default-Loop ist nach Batch C inaktiv. recvSerialBytes / handleCommand
+// / RaceLinkTransport::service / sync_service / Button-Polling laufen jetzt in
+// dedizierten FreeRTOS-Tasks (rl-usb-rx, rl-radio). Den loopTask löschen wir
+// NICHT — das Arduino-ESP32-Framework macht implizite Annahmen über dessen
+// Existenz. Stattdessen schläft er für immer.
 void loop() {
-
-  recvSerialBytes();
-  handleCommand();
-  RaceLinkTransport::service(rl, cb); // an erster stelle??
-  sync_service(rl);
-  
-  // Button: Falling erkannt?
-  if (btnFallingFlag) {
-    btnFallingFlag = false;
-    // Start der Messung – warten auf Loslassen in Polling
-    pressStartMs = millis();
-    longHandled = false;
-  }
-
-  // Loslassen erkennen & Dauer auswerten
-  if (pressStartMs != 0) {
-    bool pressed = (digitalRead(BUTTON_PIN) == LOW);
-    unsigned long now = millis();
-
-    // Long-Press Fire (einmalig)
-    if (pressed && !longHandled && (now - pressStartMs) >= 1000) {
-      longHandled = true;
-      // Long: do something
-      showDebug = !showDebug;
-      if (!showDebug) {
-        inhibitStatusDraw = false;
-        // Schedule a redraw; the display task on Core 0 picks the latest
-        // showDebug + inhibitStatusDraw values when it renders.
-        requestDisplayRedraw();
-      }
-    }
-    // Release → Short, falls kein Long
-    if (!pressed) {
-      if (!longHandled && (now - pressStartMs) >= 30) {
-        // LONG: CONTROL an lastRespondent
-        inhibitStatusDraw = false;
-        requestDisplayRedraw();
-      }
-      pressStartMs = 0;
-      longHandled  = false;
-    }
-  }
+  vTaskDelay(portMAX_DELAY);
 }
