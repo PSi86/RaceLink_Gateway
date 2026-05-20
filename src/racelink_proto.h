@@ -63,6 +63,10 @@ enum Opcode7 : uint8_t {
   OPC_CONTROL       = 0x08, // CONTROL (M2N) -- variable-length direct effect params (see layout below)
   OPC_OFFSET        = 0x09, // OFFSET (M2N) -- per-group offset_ms snapshot used by ARM_ON_SYNC + OFFSET_MODE controls
   OPC_GET_CONFIG    = 0x0A, // GET_CONFIG (M2N, 1B body=option) -> reply: same opcode N2M, body=P_Config (5B). Read-back of OPC_CONFIG-style options so the host can detect device-vs-host divergence on dialog open.
+  OPC_HEADLESS      = 0x0B, // HEADLESS (M2N broadcast) -- symbolic Headless-catalog id + brightness; receiver expands locally via the shared Headless catalog (see racelink_headless.h). Added 2026-05-16 for Headless Mode; additive (slaves not built with the catalog reject it cleanly via parseBody length check). The opcode name was changed from OPC_SCENE on 2026-05-17 to free "SCENE" terminology for a future host-level RaceLink-Scene opcode (which today travels as OPC_CONTROL); wire-format byte value 0x0B is unchanged.
+  OPC_INDICATE      = 0x0C, // INDICATE (M2N broadcast or unicast) -- short-lived status indicator overlay: P_Indicate (type + durationSec). Receiver looks up the type in the shared catalog (racelink_indicators.h), overlays the segment for durationSec seconds, then restores the pre-indicator state. durationSec==0 cancels any currently-running indicator without showing a new one. Animated only (BREATH/STROBE) per project rule.
+  OPC_RF_CONFIG     = 0x0D, // SET_RF_CONFIG (M2N unicast, 12B P_RfConfig) -- write LoRa PHY parameters to the node and persist to NVS; the node ACKs then reboots onto the new settings (~50 ms delay so the ACK gets out before the link drops). Broadcast forbidden by design (analogous to OPC_CONFIG) -- a misconfigured node would drop off-channel and become unreachable. Added 2026-05-20 for the multi-gateway / runtime-RF feature.
+  OPC_GET_RF_CONFIG = 0x0E, // GET_RF_CONFIG (M2N unicast, 1B reserved body) -> reply: same opcode N2M, body=P_RfConfig (12B). Read-back of the node's currently persisted PHY config so the host can detect drift between expected (host repo) and on-device (NVS) settings; used by the Setup-Change-Assistant.
   OPC_ACK           = 0x7E, // ACK (both directions, as response only)
   // Phase-D rename (2026-04-25): opcode values are invariant, only the
   // identifiers shifted: OPC_CONTROL -> OPC_PRESET (0x04), OPC_CONTROL_ADV
@@ -97,6 +101,48 @@ struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; u
 // reserved for a future HAS_GROUP_MASK extension carrying selective fire.
 static const uint8_t SYNC_FLAG_TRIGGER_ARMED = 0x01;
 struct __attribute__((packed)) P_Stream      { uint8_t ctrl; uint8_t data[8];         }; // 9B
+// OPC_HEADLESS body — symbolic Headless-catalog id + broadcast brightness.
+// The receiver looks ``sceneId`` up in its compile-time Headless catalog
+// (racelink_headless.h) and runs the local expansion. Used by the
+// Headless-Mode master and by external software (e.g. FPVGate) so the
+// same catalog drives both sides. Header receiver should be the
+// 0xFF:FF:FF broadcast. (Body struct + field name keep "scene" naming
+// because each catalog row is internally called a "Headless scene"; the
+// rename was scoped to the wire opcode to avoid confusion with a future
+// host-level OPC_SCENE that may replace OPC_CONTROL.)
+struct __attribute__((packed)) P_Headless    { uint8_t sceneId; uint8_t brightness;  }; // 2B
+// OPC_INDICATE body — symbolic indicator-id + duration in seconds. The
+// receiver looks ``type`` up in the shared catalog (racelink_indicators.h)
+// and overlays the segment for ``durationSec`` seconds, then restores the
+// pre-indicator state. ``durationSec == 0`` is a cancel signal.
+struct __attribute__((packed)) P_Indicate    { uint8_t type; uint8_t durationSec;    }; // 2B
+// OPC_RF_CONFIG body -- write a complete LoRa PHY configuration to the
+// node. All multi-byte fields are little-endian. The node validates
+// ranges before applying; out-of-range values are NACKed with
+// ACK_BAD_LEN (no dedicated "bad parameters" status exists today --
+// structurally "rejected" is the same outcome from the host's view).
+// On accept the node persists the new config to NVS, ACKs, and reboots
+// with a short delay (~50 ms) so the master sees the ACK before the
+// link drops. Bandwidth uses x10 scaling (e.g. 125.0 kHz -> 1250) so
+// every SX1262-supported BW (7.81/10.42/15.63/20.83/31.25/41.67/
+// 62.5/125/250/500 kHz) is exactly representable without float on the
+// wire. Persistence is unconditional for LoRa-side RF_CONFIG; the
+// gateway-only USB-CDC variant (GW_CMD_SET_RF_CONFIG) carries an
+// explicit persist/volatile flag for channel-scan use.
+struct __attribute__((packed)) P_RfConfig {
+  uint32_t freq_hz;        // 4B LE -- center frequency, e.g. 867_700_000
+  uint16_t bw_khz_x10;     // 2B LE -- bandwidth x10 (125.0 kHz -> 1250)
+  uint8_t  sf;             // 1B    -- spreading factor 5..12
+  uint8_t  cr_den;         // 1B    -- coding rate denominator 5..8 (4/5..4/8)
+  uint8_t  sync_word;      // 1B    -- LoRa sync word (private-network selector)
+  int8_t   tx_power_dbm;   // 1B    -- TX power, dBm (signed; SX1262: -9..+22)
+  uint16_t preamble;       // 2B LE -- preamble length in symbols
+}; // 12B
+// OPC_GET_RF_CONFIG body -- request the node's currently persisted PHY
+// configuration. Single reserved byte for future use (e.g. a channel-
+// slot selector if per-node config becomes multi-slot). Reserved MUST
+// be 0 today; the receiver treats non-zero as ACK_BAD_LEN.
+struct __attribute__((packed)) P_GetRfConfig { uint8_t reserved;                       }; // 1B
 // OPC_OFFSET (Master -> Node, RESP_NONE) — variable-length 2..7 B body.
 // First two bytes are always present:
 //   Byte 0: groupId (0..254 = filter; 255 = broadcast to all groups)
@@ -173,6 +219,22 @@ static const uint8_t EV_STATE_CHANGED = 0xF1;  // body: [state_byte, [metadata..
 static const uint8_t EV_TX_DONE       = 0xF3;  // body: 1 byte (last_len; legacy)
 static const uint8_t EV_TX_REJECTED   = 0xF4;  // body: [type_full, reason_byte]
 static const uint8_t EV_STATE_REPORT  = 0xF5;  // body: [state_byte, [metadata...]]
+// EV_RF_CHANGED (0xF6) -- gateway emits after a GW_CMD_SET_RF_CONFIG /
+// GW_CMD_GET_RF_CONFIG attempt. Body: [reason (1B), P_RfConfig (12B)].
+// On success the embedded P_RfConfig reflects the newly active (and
+// persisted, if persist_flag=1) values; on rejection it reflects the
+// still-active NVS values so the host knows what stayed in effect. In
+// persist mode the gateway sends this event BEFORE rebooting (~100 ms
+// gap) so the host can render a "rebooting" UI before the link blinks.
+static const uint8_t EV_RF_CHANGED    = 0xF6;  // body: [reason_byte, P_RfConfig]
+
+// Reason codes carried in EV_RF_CHANGED body[0].
+enum RfChangeReason : uint8_t {
+  RF_CHANGE_OK              = 0x00,  // applied successfully (gateway reboots if persist=1)
+  RF_CHANGE_REJECTED_RANGE  = 0x01,  // freq / SF / BW / CR / syncWord out of allowed range
+  RF_CHANGE_REJECTED_CRC    = 0x02,  // NVS slot CRC mismatch on read-back
+  RF_CHANGE_NVS_FAIL        = 0x03,  // NVS write failed
+};
 
 // Gateway state machine bytes carried inside EV_STATE_CHANGED /
 // EV_STATE_REPORT body[0]. The state set depends on the gateway's
@@ -208,7 +270,31 @@ static const uint8_t TX_REJECT_UNKNOWN   = 0xFF;
 // IDENTIFY is the legacy port-discovery ping; STATE_REQUEST is the new
 // (Batch B) gateway-state query that replies via EV_STATE_REPORT.
 static const uint8_t GW_CMD_IDENTIFY      = 0x01;  // 1-byte payload [0x01]
+// GW_CMD_SET_RF_CONFIG (0x02) -- write the gateway's own LoRa PHY config
+// (NOT a LoRa opcode; this travels over USB-CDC only). Payload layout:
+//   [GW_CMD_SET_RF_CONFIG=0x02][persist_flag (1B)][P_RfConfig (12B)]  -> 14B
+// persist_flag bit 0 = GW_RF_PERSIST_NVS: 1 = persist to NVS + reboot;
+// 0 = GW_RF_VOLATILE: apply for this session only (gateway reverts to
+// NVS-default on next boot). Volatile mode powers the host's channel-
+// scan workflow, sweeping channels without burning NVS write cycles
+// (ESP32 NVS endurance is finite).
+//
+// After successful apply the gateway emits
+// EV_RF_CHANGED(RF_CHANGE_OK, P_RfConfig) BEFORE rebooting (persist
+// mode) or before resuming RX (volatile mode), so the host can update
+// its UI before the link blinks. Validation rejects out-of-band
+// frequencies (must lie within a legal ISM band -- enforced FW-side
+// as 863..928 MHz) and unsupported SF/BW/CR combinations.
+static const uint8_t GW_CMD_SET_RF_CONFIG = 0x02;  // payload: [persist_flag, P_RfConfig]
+// GW_CMD_GET_RF_CONFIG (0x03) -- read the gateway's currently active
+// PHY config. Payload: 1-byte [0x03] only. Gateway replies via
+// EV_RF_CHANGED(RF_CHANGE_OK, P_RfConfig) with no side effect.
+static const uint8_t GW_CMD_GET_RF_CONFIG = 0x03;  // 1-byte payload [0x03] -> EV_RF_CHANGED
 static const uint8_t GW_CMD_STATE_REQUEST = 0x7F;  // 1-byte payload [0x7F] -> EV_STATE_REPORT
+
+// Persist-flag values for GW_CMD_SET_RF_CONFIG payload byte 1.
+static const uint8_t GW_RF_VOLATILE    = 0x00;  // apply now, revert to NVS on reboot (channel-scan)
+static const uint8_t GW_RF_PERSIST_NVS = 0x01;  // apply now, persist to NVS, reboot onto new config
 
 // -------------------- P_Control (variable-length, 3..21 B) --------------------
 // Master -> Node, OPC_CONTROL. Direct effect-parameter packet (pre-rename:
@@ -280,6 +366,11 @@ static_assert(sizeof(P_Config) <= BODY_MAX, "P_Config too large");
 static_assert(sizeof(P_GetConfig) <= BODY_MAX, "P_GetConfig too large");
 static_assert(sizeof(P_Sync) <= BODY_MAX, "P_Sync too large");
 static_assert(sizeof(P_Stream) <= BODY_MAX, "P_Stream too large");
+static_assert(sizeof(P_Headless) <= BODY_MAX, "P_Headless too large");
+static_assert(sizeof(P_Indicate) <= BODY_MAX, "P_Indicate too large");
+static_assert(sizeof(P_RfConfig) == 12, "P_RfConfig must be exactly 12 bytes (wire contract)");
+static_assert(sizeof(P_RfConfig) <= BODY_MAX, "P_RfConfig too large");
+static_assert(sizeof(P_GetRfConfig) <= BODY_MAX, "P_GetRfConfig too large");
 static_assert(sizeof(P_IdentifyReply) <= BODY_MAX, "P_IdentifyReply too large");
 static_assert(sizeof(P_StatusReply) <= BODY_MAX, "P_StatusReply too large");
 static_assert(sizeof(P_Ack) <= BODY_MAX, "P_Ack too large");
@@ -332,6 +423,16 @@ static constexpr PacketRule RULES[] = {
   // the host's "Device Options" dialog to detect host-vs-device divergence on
   // open; absent reply means "device does not expose this option for read".
   { OPC_GET_CONFIG, DIR_M2N, RESP_SPECIFIC, OPC_GET_CONFIG, SZ<P_GetConfig>(), SZ<P_Config>(),       "GET_CONFIG" },
+  // OPC_HEADLESS: Headless-Mode trigger (M2N broadcast, 2B body) -> no response.
+  { OPC_HEADLESS,   DIR_M2N, RESP_NONE,     0,           SZ<P_Headless>(),    0,                     "HEADLESS" },
+  // OPC_INDICATE: short-lived status indicator overlay (M2N, 2B body) -> no response.
+  { OPC_INDICATE,   DIR_M2N, RESP_NONE,     0,           SZ<P_Indicate>(),    0,                     "INDICATE" },
+  // OPC_RF_CONFIG: write LoRa PHY config to a node (M2N unicast, 12B P_RfConfig) -> ACK.
+  // Node validates, persists to NVS, ACKs, then reboots (~50 ms delay). Broadcast forbidden.
+  { OPC_RF_CONFIG,     DIR_M2N, RESP_ACK,      OPC_ACK,           SZ<P_RfConfig>(),    SZ<P_Ack>(),      "RF_CONFIG" },
+  // OPC_GET_RF_CONFIG: read-back of the node's persisted PHY config (M2N unicast,
+  // 1B reserved body) -> reply: same opcode N2M, body = P_RfConfig (12B).
+  { OPC_GET_RF_CONFIG, DIR_M2N, RESP_SPECIFIC, OPC_GET_RF_CONFIG, SZ<P_GetRfConfig>(), SZ<P_RfConfig>(), "GET_RF_CONFIG" },
 };
 
 // Lookup by 7-bit opcode

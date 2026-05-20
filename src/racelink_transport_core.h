@@ -299,10 +299,27 @@ inline void cancelRxRequest(Core& rl) {
   rl.reqRxMs = 0;
 }
 
-// One-slot TX scheduling (returns false if the slot is busy or the payload is oversize).
-// With LBT enabled: jitterMaxMs is overridden to a fixed 300 ms (TODO: derive from ToA?).
-// Without LBT and jitterMaxMs > 50: the given jitterMaxMs is used to randomly delay the TX.
-// Without LBT and jitterMaxMs == 0: TX is scheduled immediately.
+// One-slot TX scheduling (returns false if the slot is busy or the payload
+// is oversize).
+//
+// jitterMaxMs semantics (universal, regardless of rl.lbtEnable):
+//   == 0  → time-critical bypass: fire immediately, no random delay, no CAD
+//          scan. Use for low-frequency broadcasts whose in-packet timestamp
+//          must reflect the actual TX moment within single-digit ms
+//          (canonical example: OPC_SYNC keepalive). Trade-off: skips
+//          collision avoidance, occasional loss tolerable.
+//   > 0 with lbtEnable=true  → fixed 300 ms LBT cap + CAD scan before TX
+//                              (spectrum-sharing politeness).
+//   > 0 with lbtEnable=false → caller-controlled jitter, no CAD (Gateway-
+//                              style: sole TXer on its side, no need for
+//                              CAD but a small random skew helps with
+//                              host-driven burst timing).
+//
+// Cross-repo invariant: this header is byte-identical across Gateway, Host
+// and WLED. The jitterMaxMs=0 universal-bypass branch (added 2026-05-18)
+// replaces the earlier Gateway-side ``rl_queueTxNoCad`` toggle workaround
+// that flipped lbtEnable to false around the call — that pattern is no
+// longer necessary, the universal bypass produces identical behavior.
 inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500) {
 
   if (rl.txPending || len == 0 || len > sizeof(rl.txBuf)) return false; // reject if slot busy or oversize
@@ -310,26 +327,18 @@ inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t jit
   rl.txLen = len;
   rl.earliestTxAtMs = millis();
 
-  uint16_t jitterMinMs = 50; // default min jitter
+  const uint16_t jitterMinMs = 50;
 
-  if (rl.lbtEnable) {
-    //jitterMaxMs = lbtBackoffMaxMs(rl);
-    jitterMaxMs = 300; // fixed max backoff for LBT
-    uint16_t randDelayMs = randMs(rl, jitterMinMs, jitterMaxMs);
-    //rl.debug = randDelayMs;
-    rl.earliestTxAtMs += randDelayMs;
+  if (jitterMaxMs == 0) {
+    // Time-critical bypass: ignore lbtEnable, fire ASAP, no CAD.
+    rl.txArb = TxArbiter::None;
+  } else if (rl.lbtEnable) {
+    jitterMaxMs = 300; // fixed LBT cap
+    rl.earliestTxAtMs += randMs(rl, jitterMinMs, jitterMaxMs);
     rl.txArb = TxArbiter::CadNeeded;
-  } 
-  else {
-    if (jitterMaxMs == 0) {
-      rl.earliestTxAtMs += 0; // no delay
-    }
-    else if (jitterMaxMs > jitterMinMs) {
-      rl.earliestTxAtMs += randMs(rl, jitterMinMs, jitterMaxMs);
-    }
-    else {
-      rl.earliestTxAtMs += randMs(rl, jitterMinMs, 300); // at least some jitter
-    }
+  } else {
+    const uint16_t jMax = (jitterMaxMs > jitterMinMs) ? jitterMaxMs : (uint16_t)300;
+    rl.earliestTxAtMs += randMs(rl, jitterMinMs, jMax);
     rl.txArb = TxArbiter::None;
   }
 
