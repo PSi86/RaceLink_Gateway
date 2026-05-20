@@ -895,6 +895,39 @@ void handleCommand() {
         }
       } break;
 
+      case RaceLinkProto::OPC_HEADLESS: {
+        // Headless-Mode trigger (M2N broadcast, 2 B body = sceneId +
+        // brightness). Receivers expand the symbolic id locally via the
+        // shared catalog in racelink_headless.h; the gateway forwards the
+        // frame transparently without touching the catalog. Opcode was
+        // renamed from OPC_SCENE on 2026-05-17 to free "SCENE" terminology
+        // for a future host-level RaceLink-Scene opcode; wire byte 0x0B is
+        // unchanged.
+        if (bodyLen == sizeof(RaceLinkProto::P_Headless)) {
+          RaceLinkProto::P_Headless p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
+      case RaceLinkProto::OPC_INDICATE: {
+        // Status-indicator overlay (M2N broadcast or unicast, 2 B body =
+        // type + durationSec). Receivers look the type up in the shared
+        // catalog (racelink_indicators.h), overlay the segment for
+        // durationSec seconds, then restore the pre-indicator state.
+        // durationSec == 0 cancels any running indicator. The gateway
+        // forwards transparently without inspecting the type field.
+        if (bodyLen == sizeof(RaceLinkProto::P_Indicate)) {
+          RaceLinkProto::P_Indicate p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
     }
     newSerialData = false;
     return;
