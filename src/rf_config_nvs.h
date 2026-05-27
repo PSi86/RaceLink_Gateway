@@ -1,7 +1,10 @@
-// rf_config_nvs.h -- Gateway-side persistent storage for the LoRa PHY
-// config (P_RfConfig wire struct). Backs GW_CMD_SET_RF_CONFIG +
-// GW_CMD_GET_RF_CONFIG (USB-CDC) and the compile-default fallback path
-// used by setup() before radio.begin().
+// rf_config_nvs.h -- Persistent storage for the LoRa PHY config
+// (P_RfConfig wire struct). Backs the runtime reconfiguration paths
+// on both sides of the protocol:
+//   * Gateway:   GW_CMD_SET_RF_CONFIG / GW_CMD_GET_RF_CONFIG (USB-CDC)
+//   * WLED node: OPC_RF_CONFIG / OPC_GET_RF_CONFIG (LoRa wire)
+// plus the compile-default fallback used by setup() / radioInit()
+// before radio.begin().
 //
 // Design:
 //   * Header-only / inline -- avoids a separate translation unit and
@@ -10,20 +13,31 @@
 //     over the P_RfConfig bytes so a corrupted slot drops cleanly to
 //     compile-time defaults instead of feeding random bytes into
 //     radio.begin().
-//   * Boot-loop recovery: incrementBootCounter() ticks BEFORE
-//     radio.begin(); clearBootCounter() runs AFTER a successful init.
+//   * Boot-loop recovery: bootCounterIncrement() ticks BEFORE
+//     radio.begin(); bootCounterClear() runs AFTER a successful init.
 //     If the counter ever reaches BOOT_COUNTER_MAX the persisted slot
 //     is wiped on the next boot -- breaking a brick loop caused by a
 //     valid-looking-but-unflashable config (e.g. SF too high for the
 //     environment + radio.begin() hanging the firmware).
 //   * Validation lives here so the GW_CMD handler, the LoRa-side
-//     OPC_RF_CONFIG handler (future PR-3 territory on the WLED side),
-//     and load() all share one source of truth for range checks.
+//     OPC_RF_CONFIG handler, and load() all share one source of truth
+//     for range checks.
+//   * The compile-default helper lives at the call site (Gateway:
+//     main.cpp; WLED node: racelink_wled.cpp) to keep this header
+//     side-agnostic. The only per-side knowledge that has to live
+//     somewhere is the mapping of compile-default defines
+//     (RACELINK_CR vs RACELINK_CR_DEN, RACELINK_SYNC_WORD vs
+//     RACELINK_SYNCWORD) -- both call sites resolve those locally.
 //
-// This file lives in src/ only (Gateway-local); it is NOT one of the
-// four shared headers. No drift-test coverage required.
+// This file is NOT one of the four shared protocol headers
+// (racelink_proto.h, racelink_headless.h, racelink_indicators.h,
+// racelink_transport_core.h). Drift-test coverage is not required;
+// byte-identical sync across the WLED/Gateway repos is a code-hygiene
+// convention, not a wire-protocol contract.
 //
-// Added 2026-05-20 for Stage 1 PR-2 of the multi-gateway plan.
+// Added 2026-05-20 for Stage 1 of the multi-gateway plan
+// (Gateway PR-2 + WLED node PR-3); audience-neutralised on 2026-05-23
+// so a single file ships to both sides byte-identically.
 
 #pragma once
 

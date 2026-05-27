@@ -939,6 +939,37 @@ void handleCommand() {
         }
       } break;
 
+      case RaceLinkProto::OPC_RF_CONFIG: {
+        // Write a complete LoRa PHY config to a node (M2N unicast, 12 B
+        // P_RfConfig). The node persists to NVS, ACKs, then reboots
+        // onto the new settings. The gateway just forwards the frame
+        // — it is the operator's responsibility (via the migration
+        // engine) to switch the gateway's own RF afterwards so it can
+        // keep talking to the now-relocated node.
+        if (bodyLen == sizeof(RaceLinkProto::P_RfConfig)) {
+          RaceLinkProto::P_RfConfig p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
+      case RaceLinkProto::OPC_GET_RF_CONFIG: {
+        // Read back the node's currently persisted PHY config (M2N
+        // unicast, 1 B reserved body). Reply is N2M with opcode 0x0E
+        // and a 12 B P_RfConfig body, forwarded to USB by the standard
+        // transport path. Used by the host-side Setup-Change-Assistant
+        // to detect drift between expected and on-device settings.
+        if (bodyLen == sizeof(RaceLinkProto::P_GetRfConfig)) {
+          RaceLinkProto::P_GetRfConfig p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
       case RaceLinkProto::OPC_SYNC: {
         // Host triggers a global SYNC NOW (broadcast). Body is variable: 4 B
         // legacy clock-tick form, or 5 B with a trailing SYNC_FLAG_* byte.
