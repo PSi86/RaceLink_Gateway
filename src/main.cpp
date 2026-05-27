@@ -8,6 +8,7 @@
 #include <Arduino.h>
 #include "racelink_proto.h"
 #include "racelink_transport_core.h"
+#include "rf_config_nvs.h"
 
 static RaceLinkTransport::Core rl{};
 static RaceLinkTransport::Callbacks cb{};
@@ -169,6 +170,40 @@ static inline void emit_state_report() {
   // its min_ms metadata; everything else is a 1-byte body.
   bool has_meta = (gw_currentState == RaceLinkProto::GW_STATE_RX_WINDOW);
   emit_state_event(RaceLinkProto::EV_STATE_REPORT, gw_currentState, gw_currentMetaU16, has_meta);
+}
+
+// Currently active LoRa PHY configuration. Initialised in setup() from
+// NVS (with compile-time defaults as fallback) and consumed by
+// transport_init(). Updated in place by the GW_CMD_SET_RF_CONFIG handler
+// so a subsequent GW_CMD_GET_RF_CONFIG read-back reflects reality.
+static RaceLinkProto::P_RfConfig g_activeRfConfig{};
+
+// Compile-time defaults expressed in the wire-format P_RfConfig layout.
+// Used as the first-boot seed (so a fresh device persists a valid slot
+// before its first SET_RF_CONFIG) and as the boot-loop recovery target
+// after BOOT_COUNTER_MAX strikes.
+static inline RaceLinkProto::P_RfConfig getCompileDefaultRfConfig() {
+  RaceLinkProto::P_RfConfig c{};
+  c.freq_hz       = RACELINK_FREQ_HZ;
+  c.bw_khz_x10    = (uint16_t)(RACELINK_BW_KHZ * 10.0f + 0.5f);
+  c.sf            = RACELINK_SF;
+  c.cr_den        = RACELINK_CR_DEN;
+  c.sync_word     = RACELINK_SYNCWORD;
+  c.tx_power_dbm  = (int8_t)RACELINK_TX_POWER;
+  c.preamble      = RACELINK_PREAMBLE;
+  return c;
+}
+
+// Emit EV_RF_CHANGED(reason, P_RfConfig) over USB-CDC. Sent by the SET
+// and GET RF_CONFIG handlers; in persist mode the SET handler emits this
+// BEFORE rebooting so the host receives the confirmation before the
+// link blinks.
+static inline void usb_send_rf_changed(RaceLinkProto::RfChangeReason reason,
+                                       const RaceLinkProto::P_RfConfig& cfg) {
+  uint8_t buf[1 + sizeof(cfg)];
+  buf[0] = (uint8_t)reason;
+  memcpy(&buf[1], &cfg, sizeof(cfg));
+  usb_send_event_buf(RaceLinkProto::EV_RF_CHANGED, buf, sizeof(buf));
 }
 
 // NACK helper: emit EV_TX_REJECTED(type_full, reason) so the host can match
@@ -696,6 +731,12 @@ static void sync_service(RaceLinkTransport::Core& rl) {
   }
 }
 
+// Forward declaration: applyRadioConfigLive() is defined after
+// transport_init() (it shares phyFromRfConfig + beginCommon plumbing
+// with it) but is called from handleCommand()'s GW_CMD_SET_RF_CONFIG
+// volatile branch, which appears before its definition in this file.
+static bool applyRadioConfigLive(const RaceLinkProto::P_RfConfig& c);
+
 /************ Host-Kommandos (1:1) ************/
 void handleCommand() {
   if (!newSerialData) return;
@@ -719,6 +760,83 @@ void handleCommand() {
   // reconnect, and from the master-pill ↻ refresh button.
   if (payloadLen == 1 && firstByte == RaceLinkProto::GW_CMD_STATE_REQUEST) {
     emit_state_report();
+    newSerialData = false;
+    return;
+  }
+
+  // GET_RF_CONFIG: host reads back the currently active PHY config.
+  // Reply: EV_RF_CHANGED(RF_CHANGE_OK, g_activeRfConfig). No side effect.
+  if (payloadLen == 1 && firstByte == RaceLinkProto::GW_CMD_GET_RF_CONFIG) {
+    usb_send_rf_changed(RaceLinkProto::RF_CHANGE_OK, g_activeRfConfig);
+    newSerialData = false;
+    return;
+  }
+
+  // SET_RF_CONFIG: host writes a new PHY config. Payload after the
+  // command byte:
+  //   [persist_flag (1 B)] [P_RfConfig (12 B)] -> 13 B body after the
+  //   leading GW_CMD_SET_RF_CONFIG byte, i.e. payloadLen == 14.
+  //
+  // persist_flag == GW_RF_PERSIST_NVS (0x01) -> validate, persist to
+  //   NVS, emit EV_RF_CHANGED(OK, newCfg) over USB, delay ~100 ms so
+  //   the host receives the event before the link drops, then reboot
+  //   onto the new config.
+  //
+  // persist_flag == GW_RF_VOLATILE (0x00) -> validate, apply LIVE via
+  //   applyRadioConfigLive() (no NVS write, no reboot), emit
+  //   EV_RF_CHANGED(OK, newCfg). NVS still holds the previous value, so
+  //   the next reboot reverts. Used by the host's channel-scan workflow
+  //   (Stage 3) to sweep channels without burning NVS write cycles.
+  //
+  // Validation failures emit EV_RF_CHANGED with the appropriate
+  // RfChangeReason carrying the STILL-ACTIVE g_activeRfConfig (so the
+  // host knows what stayed in effect).
+  if (payloadLen == (1 + 1 + sizeof(RaceLinkProto::P_RfConfig))
+      && firstByte == RaceLinkProto::GW_CMD_SET_RF_CONFIG) {
+    const uint8_t persist_flag = receivedBytes[2];
+    RaceLinkProto::P_RfConfig newCfg{};
+    memcpy(&newCfg, &receivedBytes[3], sizeof(newCfg));
+
+    auto reason = RfConfigNvs::validate(newCfg);
+    if (reason != RaceLinkProto::RF_CHANGE_OK) {
+      usb_send_rf_changed(reason, g_activeRfConfig);
+      newSerialData = false;
+      return;
+    }
+
+    if (persist_flag == RaceLinkProto::GW_RF_PERSIST_NVS) {
+      // Persist first so the EV_RF_CHANGED we emit reflects the value
+      // that will survive the reboot.
+      const auto storeReason = RfConfigNvs::store(newCfg);
+      if (storeReason != RaceLinkProto::RF_CHANGE_OK) {
+        usb_send_rf_changed(storeReason, g_activeRfConfig);
+        newSerialData = false;
+        return;
+      }
+      g_activeRfConfig = newCfg;
+      usb_send_rf_changed(RaceLinkProto::RF_CHANGE_OK, g_activeRfConfig);
+      // Give the host's serial reader time to drain the event before
+      // the USB link blinks. The reboot is what actually applies the
+      // new config (transport_init() loads NVS in setup()).
+      Serial.flush();
+      delay(100);
+      ESP.restart();
+      // not reached
+    } else {
+      // Volatile / channel-scan path: live-reconfigure the radio
+      // without touching NVS.
+      if (!applyRadioConfigLive(newCfg)) {
+        // beginCommon failed on otherwise-valid params -- treat as a
+        // range rejection from the radio's perspective and leave the
+        // previous config (which is still partly in the radio's state
+        // after a failed begin) as authoritative.
+        usb_send_rf_changed(RaceLinkProto::RF_CHANGE_REJECTED_RANGE, g_activeRfConfig);
+        newSerialData = false;
+        return;
+      }
+      g_activeRfConfig = newCfg;
+      usb_send_rf_changed(RaceLinkProto::RF_CHANGE_OK, g_activeRfConfig);
+    }
     newSerialData = false;
     return;
   }
@@ -821,6 +939,37 @@ void handleCommand() {
         }
       } break;
 
+      case RaceLinkProto::OPC_RF_CONFIG: {
+        // Write a complete LoRa PHY config to a node (M2N unicast, 12 B
+        // P_RfConfig). The node persists to NVS, ACKs, then reboots
+        // onto the new settings. The gateway just forwards the frame
+        // — it is the operator's responsibility (via the migration
+        // engine) to switch the gateway's own RF afterwards so it can
+        // keep talking to the now-relocated node.
+        if (bodyLen == sizeof(RaceLinkProto::P_RfConfig)) {
+          RaceLinkProto::P_RfConfig p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
+      case RaceLinkProto::OPC_GET_RF_CONFIG: {
+        // Read back the node's currently persisted PHY config (M2N
+        // unicast, 1 B reserved body). Reply is N2M with opcode 0x0E
+        // and a 12 B P_RfConfig body, forwarded to USB by the standard
+        // transport path. Used by the host-side Setup-Change-Assistant
+        // to detect drift between expected and on-device settings.
+        if (bodyLen == sizeof(RaceLinkProto::P_GetRfConfig)) {
+          RaceLinkProto::P_GetRfConfig p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
       case RaceLinkProto::OPC_SYNC: {
         // Host triggers a global SYNC NOW (broadcast). Body is variable: 4 B
         // legacy clock-tick form, or 5 B with a trailing SYNC_FLAG_* byte.
@@ -895,6 +1044,39 @@ void handleCommand() {
         }
       } break;
 
+      case RaceLinkProto::OPC_HEADLESS: {
+        // Headless-Mode trigger (M2N broadcast, 2 B body = sceneId +
+        // brightness). Receivers expand the symbolic id locally via the
+        // shared catalog in racelink_headless.h; the gateway forwards the
+        // frame transparently without touching the catalog. Opcode was
+        // renamed from OPC_SCENE on 2026-05-17 to free "SCENE" terminology
+        // for a future host-level RaceLink-Scene opcode; wire byte 0x0B is
+        // unchanged.
+        if (bodyLen == sizeof(RaceLinkProto::P_Headless)) {
+          RaceLinkProto::P_Headless p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
+      case RaceLinkProto::OPC_INDICATE: {
+        // Status-indicator overlay (M2N broadcast or unicast, 2 B body =
+        // type + durationSec). Receivers look the type up in the shared
+        // catalog (racelink_indicators.h), overlay the segment for
+        // durationSec seconds, then restore the pre-indicator state.
+        // durationSec == 0 cancels any running indicator. The gateway
+        // forwards transparently without inspecting the type field.
+        if (bodyLen == sizeof(RaceLinkProto::P_Indicate)) {
+          RaceLinkProto::P_Indicate p{};
+          memcpy(&p, body, sizeof(p));
+          n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
     }
     newSerialData = false;
     return;
@@ -923,22 +1105,28 @@ static inline void usb_forward_transport(const uint8_t* pkt, uint8_t len, int16_
 }
 
 /************ RaceLink transport init (RadioLib) ************/
+// Build a PhyCfg snapshot from the active wire-format P_RfConfig. The
+// shared transport_core.h continues to take its parameters as floats
+// (freqMHz / bwKHz) -- we convert here on the boundary.
+static inline RaceLinkTransport::PhyCfg phyFromRfConfig(const RaceLinkProto::P_RfConfig& c) {
+  RaceLinkTransport::PhyCfg phy;
+  phy.freqMHz   = (float)c.freq_hz / 1e6f;
+  phy.bwKHz     = (float)c.bw_khz_x10 / 10.0f;
+  phy.sf        = c.sf;
+  phy.crDen     = c.cr_den;
+  phy.syncWord  = c.sync_word;
+  phy.preamble  = c.preamble;
+  phy.crcOn     = true;
+  phy.txPowerDbm   = c.tx_power_dbm;
+  phy.dio2RfSwitch = 1;
+  phy.rxBoost      = -1;
+  return phy;
+}
+
 void transport_init() {
   SPI.begin(RACELINK_SCK, RACELINK_MISO, RACELINK_MOSI, RACELINK_CS);
 
-  RaceLinkTransport::PhyCfg phy;
-  phy.freqMHz   = (float)RACELINK_FREQ_HZ / 1e6f;
-  phy.bwKHz     = RACELINK_BW_KHZ;
-  phy.sf        = RACELINK_SF;
-  phy.crDen     = RACELINK_CR_DEN;
-  phy.syncWord  = RACELINK_SYNCWORD;
-  phy.preamble  = RACELINK_PREAMBLE;
-  phy.crcOn     = true;
-
-  // Gerätespezifische Overrides (wie bisher im Master):
-  phy.txPowerDbm   = RACELINK_TX_POWER;     // z.B. 14
-  phy.dio2RfSwitch = 1;                   // vorher: radio.setDio2AsRfSwitch(true);
-  phy.rxBoost      = -1;                  // (lassen) oder 1/0 je nach Board
+  RaceLinkTransport::PhyCfg phy = phyFromRfConfig(g_activeRfConfig);
 
   if (!RaceLinkTransport::beginCommon(radio, rl, phy)) {
     // Fehlerhandling wie bisher
@@ -964,9 +1152,36 @@ void transport_init() {
   // ~1 s host-command latency: the cap was masking the 50-2500 ms jitter
   // default that try_schedule_or_nack used to inherit.
   rl.lbtEnable = false;   // gateway-side default, distinct from the Core struct's default of true
-  
+
   RaceLinkTransport::attachDio1(radio, rl);
   RaceLinkTransport::setDefaultRxContinuous(rl);
+}
+
+// Reconfigure the radio at runtime without rebooting. Used for the
+// volatile branch of GW_CMD_SET_RF_CONFIG (channel-scan path) where we
+// must NOT write NVS (to spare ESP32 NVS write-endurance) and we must
+// NOT reboot (because reboot would re-load NVS and revert to the
+// persisted channel before the scan dwell window even starts -- the
+// transient channel would be lost).
+//
+// RadioLib's SX1262::begin() is documented as re-entrant; calling it
+// again with a new PhyCfg standby's the radio internally, re-applies
+// the full PHY configuration, and returns to standby. We then re-arm
+// continuous RX so on_rx_open_cb / on_rx_packet_cb keep firing on the
+// new channel. attachDio1() is idempotent at the ISR level but cheap
+// to re-call defensively after a radio-state reset.
+//
+// Returns true iff beginCommon() succeeded. On failure the caller
+// emits EV_RF_CHANGED(REJECTED_RANGE) and the radio is in an unknown
+// state -- a follow-up persist-mode SET with valid params (or a
+// reboot) is the recovery.
+static bool applyRadioConfigLive(const RaceLinkProto::P_RfConfig& c) {
+  RaceLinkTransport::PhyCfg phy = phyFromRfConfig(c);
+  if (!RaceLinkTransport::beginCommon(radio, rl, phy)) return false;
+  RaceLinkTransport::attachDio1(radio, rl);
+  rl.lbtEnable = false;   // preserve the gateway-side LBT-off default
+  RaceLinkTransport::setDefaultRxContinuous(rl);
+  return true;
 }
 
 // --- benannte Callbacks (Master) ---
@@ -1078,8 +1293,38 @@ void setup() {
     memset(myLast3, 0, 3);
   } */
 
-  // RaceLink transport
+  // ---- RF config bring-up (NVS-backed, runtime-tunable since Stage 1 PR-2)
+  //
+  // Boot-loop recovery: tick the counter BEFORE radio init. If we've
+  // hit BOOT_COUNTER_MAX strikes the persisted slot is presumed to be
+  // bricking the gateway (e.g. SF too high for the environment, an
+  // unreachable Fcc band, or a corrupted blob that survived the CRC
+  // check). Wipe the slot now; the next load() returns false and we
+  // fall through to compile defaults below.
+  const uint8_t bootStrikes = RfConfigNvs::bootCounterIncrement();
+  if (bootStrikes > RfConfigNvs::BOOT_COUNTER_MAX) {
+    RfConfigNvs::wipe();
+  }
+
+  // Load the active config. Order of preference:
+  //   1) Validated NVS slot (the operator-set value, survives reboots).
+  //   2) Compile-time defaults (RACELINK_FREQ_HZ etc.). On first boot
+  //      we additionally persist these defaults so a later GET sees a
+  //      complete picture and so the operator can pivot via a normal
+  //      SET without first probing for "is anything there yet".
+  if (!RfConfigNvs::load(g_activeRfConfig)) {
+    g_activeRfConfig = getCompileDefaultRfConfig();
+    RfConfigNvs::store(g_activeRfConfig);
+  }
+
+  // RaceLink transport (reads g_activeRfConfig via phyFromRfConfig).
   transport_init();
+
+  // Radio came up cleanly -- reset the strike counter so the next clean
+  // boot starts at zero. A hang inside transport_init() would leave the
+  // counter ticked, and the next boot (after the user power-cycles)
+  // re-enters the recovery branch.
+  RfConfigNvs::bootCounterClear();
   cb.onTxStart       = on_tx_start_cb;
   cb.onTxDone        = on_tx_done_cb;
   cb.onRxWindowOpen  = on_rx_open_cb;
