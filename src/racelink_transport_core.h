@@ -45,9 +45,11 @@
 #include <RadioLib.h>
 
 #include "racelink_proto.h"
-extern "C" {
-  #include <esp_mac.h>
-}
+
+// Transport-agnostic helpers (MAC/address utilities, StreamStatus, the RX-side
+// stream-reassembly state machine) live in the shared header below and are
+// reused byte-for-byte by the Ethernet backend. Pulls in <esp_mac.h>.
+#include "racelink_transport_common.h"
 
 namespace RaceLinkTransport {
 
@@ -206,51 +208,10 @@ static void RL_ISR_ATTR onDio1ISR_trampoline() {
 }
 
 // -------------------- Helpers --------------------
-// -------------------- Address utilities --------------------
-inline bool readEfuseMac6(uint8_t mac6[6]) {
-#if defined(ESP_PLATFORM) || defined(ESP32)
-  if (esp_read_mac(mac6, ESP_MAC_WIFI_STA) == ESP_OK) return true;
-#else
-  String m = WiFi.macAddress();
-  if (m.length() == 17) {
-    for (int i=0;i<6;i++) mac6[i] = strtoul(m.substring(3*i, 3*i+2).c_str(), nullptr, 16);
-    return true;
-  }
-#endif
-  return false;
-}
-
-inline void last3FromMac6(uint8_t out[3], const uint8_t mac6[6]) {
-  out[0] = mac6[3]; out[1] = mac6[4]; out[2] = mac6[5];
-}
-
-/* inline void mac6_to_str(const uint8_t m[6], char out[18]) {
-  snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
-} */
-
-inline void mac6ToStr(const uint8_t mac6[6], char out[18]) {
-  static const char HEX_lookup[] = "0123456789ABCDEF";
-  for (int i=0,j=0;i<6;i++) {
-    uint8_t v = mac6[i];
-    out[j++] = HEX_lookup[(v>>4)&0xF];
-    out[j++] = HEX_lookup[v&0xF];
-    if (i<5) out[j++] = ':';
-  }
-  out[17] = '\0';
-}
-
-// -------------------- Receiver/Broadcast helpers --------------------
-inline bool same3(const uint8_t a[3], const uint8_t b[3]) {
-  return a[0]==b[0] && a[1]==b[1] && a[2]==b[2];
-}
-
-inline bool isBroadcast3(const uint8_t last3[3]) {
-  return last3[0]==0xFF && last3[1]==0xFF && last3[2]==0xFF;
-}
-
-inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]) {
-  return isBroadcast3(receiver3) || same3(receiver3, myLast3);
-}
+// NOTE: the transport-agnostic address/MAC helpers (readEfuseMac6,
+// last3FromMac6, mac6ToStr, same3, isBroadcast3, receiverMatches) now live in
+// racelink_transport_common.h (included above) so the Ethernet backend reuses
+// them verbatim. The LoRa-only helpers (LBT backoff, RadioLib RNG) stay here.
 
 // Maximum LBT backoff in milliseconds, based on time-on-air for the longest possible packet.
 // (e.g. a 64-byte packet at SF7/BW125/CR45 takes ~150 ms)
@@ -372,18 +333,10 @@ inline bool buildEmptyAndSchedule(Core& rl, const uint8_t my3[3], const uint8_t 
   return scheduleSend(rl, out, n);
 }
 
-// -------------------- Stream helpers --------------------
-enum class StreamStatus : uint8_t { StreamStart, StreamContinue, StreamEnd, Error };
-
-inline const uint8_t* streamBuffer(const Core& rl, uint8_t& len) {
-  len = rl.streamLen;
-  return rl.streamBuf;
-}
-
-inline void clearStreamReady(Core& rl) {
-  rl.streamReady = false;
-}
-
+// -------------------- Stream helpers (TX scheduling) --------------------
+// StreamStatus + the RX-side reassembly (handleStreamPacket / streamBuffer /
+// clearStreamReady) live in racelink_transport_common.h. The TX-side scheduling
+// below stays here because it calls the LoRa-specific scheduleSend().
 inline bool scheduleStreamSend(Core& rl, const uint8_t* data, uint8_t len,
                                const uint8_t src3[3], const uint8_t dst3[3],
                                uint8_t fullType, uint16_t rxMs, int8_t rxNumWanted = 1) {
@@ -439,64 +392,9 @@ inline bool queueNextStreamPacket(Core& rl) {
   return true;
 }
 
-inline StreamStatus handleStreamPacket(Core& rl, const RaceLinkProto::P_Stream& pkt) {
-  constexpr uint8_t kStreamDataLen = sizeof(pkt.data);
-  constexpr uint8_t kMaxPackets = 16;
-  const RaceLinkProto::StreamCtrl ctrl = RaceLinkProto::decode_stream_ctrl(pkt.ctrl);
-
-  if (ctrl.packets_left >= kMaxPackets) return StreamStatus::Error;
-  if (rl.streamMode == Core::StreamMode::Tx) return StreamStatus::Error;
-
-  if (ctrl.start) {
-    // Single-packet stream: start && stop with packets_left == 0 is valid.
-    // Multi-packet start: stop must be unset and packets_left > 0.
-    if (ctrl.stop && ctrl.packets_left != 0) return StreamStatus::Error;
-    if (!ctrl.stop && ctrl.packets_left == 0) return StreamStatus::Error;
-    rl.streamMode = Core::StreamMode::Rx;
-    rl.streamActive = true;
-    rl.streamReady = false;
-    rl.streamLen = 0;
-    rl.streamOffset = 0;
-    rl.streamLastPacketsLeft = ctrl.packets_left;
-    if (rl.streamOffset + kStreamDataLen > sizeof(rl.streamBuf)) return StreamStatus::Error;
-    memcpy(&rl.streamBuf[rl.streamOffset], pkt.data, kStreamDataLen);
-    rl.streamOffset += kStreamDataLen;
-    rl.streamLen = rl.streamOffset;
-    if (ctrl.stop) {
-      // Single-packet stream is already complete in this one frame.
-      rl.streamActive = false;
-      rl.streamReady = true;
-      rl.streamLastPacketsLeft = 0;
-      rl.streamMode = Core::StreamMode::None;
-      return StreamStatus::StreamEnd;
-    }
-    return StreamStatus::StreamStart;
-  }
-
-  if (!rl.streamActive) return StreamStatus::Error;
-
-  if (ctrl.stop) {
-    if (ctrl.packets_left != 0 || rl.streamLastPacketsLeft != 1) return StreamStatus::Error;
-    if (rl.streamOffset + kStreamDataLen > sizeof(rl.streamBuf)) return StreamStatus::Error;
-    memcpy(&rl.streamBuf[rl.streamOffset], pkt.data, kStreamDataLen);
-    rl.streamOffset += kStreamDataLen;
-    rl.streamLen = rl.streamOffset;
-    rl.streamActive = false;
-    rl.streamReady = true;
-    rl.streamLastPacketsLeft = 0;
-    rl.streamMode = Core::StreamMode::None;
-    return StreamStatus::StreamEnd;
-  }
-
-  if (ctrl.packets_left == 0) return StreamStatus::Error;
-  if (ctrl.packets_left != static_cast<uint8_t>(rl.streamLastPacketsLeft - 1)) return StreamStatus::Error;
-  if (rl.streamOffset + kStreamDataLen > sizeof(rl.streamBuf)) return StreamStatus::Error;
-  memcpy(&rl.streamBuf[rl.streamOffset], pkt.data, kStreamDataLen);
-  rl.streamOffset += kStreamDataLen;
-  rl.streamLen = rl.streamOffset;
-  rl.streamLastPacketsLeft = ctrl.packets_left;
-  return StreamStatus::StreamContinue;
-}
+// handleStreamPacket (RX reassembly) moved to racelink_transport_common.h as a
+// template so both transports share it; the Core's nested StreamMode satisfies
+// the template's CoreT::StreamMode requirement.
 
 // -------------------- Radio initialization common code --------------------
 #if defined(RACELINK_SX1262)
