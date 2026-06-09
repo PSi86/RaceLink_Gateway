@@ -17,7 +17,8 @@ enum RL_Dev_Type : uint8_t {
   NODE_WLED_REV1 = 10,
   NODE_WLED_REV3 = 11,
   NODE_WLED_REV4 = 12,
-  NODE_WLED_REV5 = 13,
+  NODE_WLED_REV5 = 13,             // ESP32-S3 + W5500 Ethernet (SPI)
+  NODE_WLED_ETH_GLEDOPTO = 14,     // GLEDOPTO GL-C-616WL: classic ESP32 + internal EMAC
   NODE_WLED_STARTBLOCK_REV3 = 50,
   NODE_WLED_STARTBLOCK_HWP  = 51   // Heltec Wireless Paper Startblock
   // Add more device types as needed
