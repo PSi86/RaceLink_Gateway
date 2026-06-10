@@ -23,7 +23,8 @@ jobs:
 
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      RELEASE_ENV: WirelessStickV3-ESP32S3
+      # Space-separated list of PlatformIO environments to build and ship.
+      RELEASE_ENVS: "WirelessStickV3-ESP32S3 HeltecWiFiLoRa32V4-ESP32S3"
 
     steps:
       - name: Check out RaceLink_Gateway repository
@@ -94,13 +95,18 @@ jobs:
           python -m pip install platformio
 
       - name: Build gateway firmware
-        run: python -m platformio run -e "${{ env.RELEASE_ENV }}"
+        run: |
+          for env_name in $RELEASE_ENVS; do
+            echo "::group::Build $env_name"
+            python -m platformio run -e "$env_name"
+            echo "::endgroup::"
+          done
 
       - name: Stage release artifacts
         id: stage_artifacts
         env:
           RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
-          RELEASE_ENV: ${{ env.RELEASE_ENV }}
+          RELEASE_ENVS: ${{ env.RELEASE_ENVS }}
         run: |
           python - <<'PY'
           import hashlib
@@ -109,27 +115,34 @@ jobs:
           from pathlib import Path
 
           release_version = os.environ["RELEASE_VERSION"]
-          release_env = os.environ["RELEASE_ENV"]
-
-          source_firmware = Path(".pio") / "build" / release_env / "firmware.bin"
-          if not source_firmware.is_file():
-              raise SystemExit(f"Expected firmware artifact not found: {source_firmware}")
+          release_envs = os.environ["RELEASE_ENVS"].split()
 
           dist_dir = Path("dist")
           dist_dir.mkdir(parents=True, exist_ok=True)
 
-          firmware_name = f"RaceLink_Gateway-{release_version}-{release_env}.bin"
-          firmware_path = dist_dir / firmware_name
-          shutil.copy2(source_firmware, firmware_path)
+          firmware_names = []
+          checksum_lines = []
+          for release_env in release_envs:
+              source_firmware = Path(".pio") / "build" / release_env / "firmware.bin"
+              if not source_firmware.is_file():
+                  raise SystemExit(f"Expected firmware artifact not found: {source_firmware}")
 
-          digest = hashlib.sha256(firmware_path.read_bytes()).hexdigest()
+              firmware_name = f"RaceLink_Gateway-{release_version}-{release_env}.bin"
+              firmware_path = dist_dir / firmware_name
+              shutil.copy2(source_firmware, firmware_path)
+              firmware_names.append(firmware_name)
+
+              digest = hashlib.sha256(firmware_path.read_bytes()).hexdigest()
+              checksum_lines.append(f"{digest}  {firmware_name}")
+
+          # One combined checksum file listing every shipped firmware.
           checksum_name = f"RaceLink_Gateway-{release_version}-sha256.txt"
           checksum_path = dist_dir / checksum_name
-          checksum_path.write_text(f"{digest}  {firmware_name}\n", encoding="utf-8")
+          checksum_path.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
 
           github_output = Path(os.environ["GITHUB_OUTPUT"])
           with github_output.open("a", encoding="utf-8") as handle:
-              handle.write(f"firmware_name={firmware_name}\n")
+              handle.write(f"firmware_names={' '.join(firmware_names)}\n")
               handle.write(f"checksum_name={checksum_name}\n")
           PY
 
@@ -152,7 +165,7 @@ jobs:
         with:
           name: racelink_gateway_release
           path: |
-            dist/${{ steps.stage_artifacts.outputs.firmware_name }}
+            dist/RaceLink_Gateway-*.bin
             dist/${{ steps.stage_artifacts.outputs.checksum_name }}
 
       - name: Publish GitHub release
@@ -162,7 +175,7 @@ jobs:
           target_commitish: ${{ inputs.target_branch }}
           generate_release_notes: true
           files: |
-            dist/${{ steps.stage_artifacts.outputs.firmware_name }}
+            dist/RaceLink_Gateway-*.bin
             dist/${{ steps.stage_artifacts.outputs.checksum_name }}
 
       - name: Write workflow summary
@@ -173,8 +186,8 @@ jobs:
             echo
             echo "- Gateway version: \`${{ steps.release_version.outputs.version }}\`"
             echo "- Gateway tag: \`${{ steps.release_version.outputs.tag }}\`"
-            echo "- PlatformIO environment: \`${{ env.RELEASE_ENV }}\`"
-            echo "- Firmware artifact: \`${{ steps.stage_artifacts.outputs.firmware_name }}\`"
+            echo "- PlatformIO environments: \`${{ env.RELEASE_ENVS }}\`"
+            echo "- Firmware artifacts: \`${{ steps.stage_artifacts.outputs.firmware_names }}\`"
             echo "- SHA256 artifact: \`${{ steps.stage_artifacts.outputs.checksum_name }}\`"
             echo "- Trigger: \`workflow_dispatch\`"
           } >> "$GITHUB_STEP_SUMMARY"
