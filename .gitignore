@@ -9,3 +9,7 @@
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+
+# Python bytecode caches (scripts/ and tests/ are plain modules).
+__pycache__/
+*.py[cod]
