@@ -13,3 +13,6 @@ CLAUDE.local.md
 # Python bytecode caches (scripts/ and tests/ are plain modules).
 __pycache__/
 *.py[cod]
+
+# Staged release artifacts (scripts/stage_release_artifacts.py).
+dist/
