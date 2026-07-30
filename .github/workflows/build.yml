@@ -1,0 +1,179 @@
+name: Build Firmware
+
+# Compile-only counterpart to release.yml. That workflow is the only thing that
+# ever built this repo, and it tags and publishes as part of the same run — so a
+# broken build or a broken staging step surfaced in the middle of a real release.
+# This one builds every environment declared in platformio.ini and ships nothing.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - name: Check out RaceLink_Gateway repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      # The pinned platform plus its toolchain is by far the slowest part of the
+      # job; platformio.ini is the file that decides which one gets installed.
+      - name: Cache PlatformIO installation
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install platformio
+          # Same pin as release.yml — this job rehearses the staging step.
+          python -m pip install "esptool>=5,<6"
+
+      - name: Run static tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      # No -e: platformio.ini declares no default_envs, so this builds every
+      # environment. A new hardware target is covered without touching this file.
+      - name: Build every environment
+        run: python -m platformio run
+
+      # The unit test asserts that platformio.ini points at the committed
+      # partition table; this asserts that the table actually reached the binary.
+      - name: Verify the built partition tables match the committed CSV
+        run: |
+          python - <<'PY'
+          import struct
+          from pathlib import Path
+
+          def parse_csv(path):
+              rows = []
+              for raw in path.read_text(encoding="utf-8").splitlines():
+                  line = raw.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  name, _type, _sub, offset, size = [f.strip() for f in line.split(",")][:5]
+                  rows.append((name, int(offset, 0), int(size, 0)))
+              return rows
+
+          def parse_bin(path):
+              rows = []
+              data = path.read_bytes()
+              for i in range(0, len(data), 32):
+                  entry = data[i:i + 32]
+                  if entry[:2] != b"\xaa\x50":
+                      break
+                  offset, size = struct.unpack("<II", entry[4:12])
+                  rows.append((entry[12:28].rstrip(b"\x00").decode(), offset, size))
+              return rows
+
+          expected = parse_csv(Path("partitions/racelink_gateway_8MB.csv"))
+          built = sorted(Path(".pio/build").glob("*/partitions.bin"))
+          if not built:
+              raise SystemExit("No partitions.bin found — did the build run?")
+          for path in built:
+              actual = parse_bin(path)
+              if actual != expected:
+                  raise SystemExit(
+                      f"{path.parent.name} partition table differs from the committed CSV\n"
+                      f"  expected: {expected}\n  built:    {actual}"
+                  )
+              print(f"{path.parent.name}: partition table matches")
+          PY
+
+      # release.yml is dispatch-only and tags before it publishes, so a broken
+      # staging step used to surface mid-release. Rehearsing it here means the
+      # only difference on release day is the version string.
+      - name: Rehearse release staging
+        run: |
+          python -m platformio project metadata --json-output-path metadata.json
+          args=()
+          for env_name in $(python -c "import json; print(' '.join(json.load(open('metadata.json'))))"); do
+            args+=("--env" "$env_name")
+          done
+          python scripts/stage_release_artifacts.py \
+            --version 0.0.0-ci \
+            --metadata metadata.json \
+            --dist-dir dist \
+            "${args[@]}"
+
+      - name: Verify the staged factory images
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(
+              next(Path("dist").glob("*-assets.json")).read_text(encoding="utf-8")
+          )
+          for environment in manifest["environments"]:
+              assets = {asset["kind"]: asset for asset in environment["assets"]}
+              image = (Path("dist") / assets["factory"]["file"]).read_bytes()
+              app_offset = environment["app_offset"]
+
+              expectations = [
+                  (assets["bootloader"]["offset"], b"\xe9", "bootloader"),
+                  (assets["partitions"]["offset"], b"\xaa\x50", "partition table"),
+                  (app_offset, b"\xe9", "application"),
+              ]
+              for offset, magic, label in expectations:
+                  found = image[offset : offset + len(magic)]
+                  if found != magic:
+                      raise SystemExit(
+                          f"{environment['env']}: no {label} at 0x{offset:x} "
+                          f"(found {found.hex()}, expected {magic.hex()})"
+                      )
+
+              published = (Path("dist") / assets["app"]["file"]).read_bytes()
+              if image[app_offset : app_offset + len(published)] != published:
+                  raise SystemExit(
+                      f"{environment['env']}: the application embedded in the factory "
+                      "image differs from the published application image"
+                  )
+              print(f"{environment['env']}: factory image layout verified ({len(image)} bytes)")
+          PY
+
+      - name: Write build summary
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          lines = ["## Build Summary", "", "| Environment | firmware.bin |", "|---|---|"]
+          for firmware in sorted(Path(".pio/build").glob("*/firmware.bin")):
+              lines.append(f"| `{firmware.parent.name}` | {firmware.stat().st_size / 1024:.1f} KiB |")
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      # The rehearsed release assets, so a pull request can be flashed on
+      # hardware — including the factory image — without cutting a release.
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: racelink_gateway_build
+          if-no-files-found: error
+          path: dist/*
