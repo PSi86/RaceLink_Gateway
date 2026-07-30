@@ -57,6 +57,14 @@ jobs:
       - name: Run static tests
         run: python -m unittest discover -s tests -p "test_*.py"
 
+      # Before the build, not after: `project metadata` cleans the build
+      # directory whenever it changes PlatformIO's project checksum — resolving
+      # a dependency the build had not is enough — which would delete the very
+      # firmware.bin about to be staged. Everything it reports is derived from
+      # the configuration, so the files it names need not exist yet.
+      - name: Collect PlatformIO build metadata
+        run: python -m platformio project metadata --json-output-path metadata.json
+
       # No -e: platformio.ini declares no default_envs, so this builds every
       # environment. A new hardware target is covered without touching this file.
       - name: Build every environment
@@ -110,7 +118,6 @@ jobs:
       # only difference on release day is the version string.
       - name: Rehearse release staging
         run: |
-          python -m platformio project metadata --json-output-path metadata.json
           args=()
           for env_name in $(python -c "import json; print(' '.join(json.load(open('metadata.json'))))"); do
             args+=("--env" "$env_name")

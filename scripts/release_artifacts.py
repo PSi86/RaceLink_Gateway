@@ -1,8 +1,10 @@
-"""Pure helpers for staging RaceLink_Gateway release artifacts.
+"""Pure helpers for staging RaceLink release artifacts.
 
-Everything in this module is I/O-free so the release workflow's naming, offset
-and chip-detection logic can be exercised without a toolchain; the CLI wrapper
-lives in :mod:`scripts.stage_release_artifacts`.
+Kept byte-identical in RaceLink_Gateway and RaceLink_WLED: both publish the same
+asset shapes, and a fix to the offset or chip logic has to reach both. The
+module is I/O-free so the release workflows' naming, offset and chip-detection
+logic can be exercised without a toolchain; each repository's CLI wrapper does
+the copying and calls out to esptool.
 
 Design notes:
 
@@ -177,11 +179,16 @@ def device_type(defines: Iterable[str]) -> int | None:
 
 # --- Artifact naming ------------------------------------------------------
 #
-# Field order: product, release version, environment, device type, kind. The
-# kind goes last because it is the most visible token in a file picker, and the
-# factory image must never be mistaken for something OTA-able. The three
-# pre-application images carry no device type — they are build by-products of
-# the environment, not firmware identity.
+# Field order: product, release version, environment, device type, variant,
+# kind. The kind goes last because it is the most visible token in a file
+# picker, and the factory image must never be mistaken for something OTA-able.
+# The three pre-application images carry neither device type nor variant — they
+# are build by-products of the environment, not firmware identity.
+#
+# `variant` carries the upstream version a build was made against, so a
+# RaceLink_WLED asset states both its own release and the WLED release it wraps
+# ("wled_v0.15.3"). Fields never contain "-", so the name stays parseable, but
+# consumers should read the assets.json sidecar rather than the filename.
 
 FACTORY_KIND = "factory-usb-serial-only"
 APP_KIND = "app"
@@ -194,11 +201,14 @@ def artifact_name(
     env: str,
     kind: str,
     dev_type: int | None = None,
+    variant: str | None = None,
     extension: str = ".bin",
 ) -> str:
     parts = [product, version, env]
     if dev_type is not None:
         parts.append(f"TYPE{dev_type}")
+    if variant is not None:
+        parts.append(variant)
     parts.append(kind)
     return "-".join(parts) + extension
 

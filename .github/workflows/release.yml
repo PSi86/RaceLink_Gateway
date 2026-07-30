@@ -98,17 +98,15 @@ jobs:
           # script relies on (flash mode/freq/size = keep) stay put.
           python -m pip install "esptool>=5,<6"
 
-      - name: Build gateway firmware
-        run: |
-          for env_name in $RELEASE_ENVS; do
-            echo "::group::Build $env_name"
-            python -m platformio run -e "$env_name"
-            echo "::endgroup::"
-          done
-
       # Reports, per environment, the pre-application images and the offsets the
       # platform itself would flash them at. Reading them here rather than
       # hard-coding a per-SoC table means a new target needs no workflow change.
+      #
+      # Before the build, not after: `project metadata` cleans the build
+      # directory whenever it changes PlatformIO's project checksum — resolving
+      # a dependency the build had not is enough — which would delete the very
+      # firmware.bin about to be staged. Everything it reports is derived from
+      # the configuration, so the files it names need not exist yet.
       - name: Collect PlatformIO build metadata
         run: |
           args=()
@@ -116,6 +114,14 @@ jobs:
             args+=("-e" "$env_name")
           done
           python -m platformio project metadata "${args[@]}" --json-output-path metadata.json
+
+      - name: Build gateway firmware
+        run: |
+          for env_name in $RELEASE_ENVS; do
+            echo "::group::Build $env_name"
+            python -m platformio run -e "$env_name"
+            echo "::endgroup::"
+          done
 
       # Stages, per environment: the application image, the three
       # pre-application images (so a blank chip can be commissioned without a

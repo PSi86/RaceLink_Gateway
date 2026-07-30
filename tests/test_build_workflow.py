@@ -50,6 +50,16 @@ class BuildWorkflowTests(unittest.TestCase):
         # `run` covers every environment, including ones added later.
         self.assertIn("python -m platformio run\n", source)
 
+    def test_build_workflow_collects_metadata_before_building(self) -> None:
+        # See tests/test_release_workflow.py — `project metadata` cleans the
+        # build directory, so the rehearsal has to collect it first too.
+        source = BUILD_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertLess(
+            source.index("project metadata --json-output-path"),
+            source.index("python -m platformio run\n"),
+        )
+
     def test_build_workflow_publishes_nothing(self) -> None:
         source = BUILD_WORKFLOW.read_text(encoding="utf-8")
 

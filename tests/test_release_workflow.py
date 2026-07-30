@@ -23,11 +23,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
         # emits the dashed form, so an unpinned major would break a release.
         self.assertIn('python -m pip install "esptool>=5,<6"', self.source)
 
-    def test_metadata_is_collected_before_staging(self) -> None:
+    def test_metadata_is_collected_before_the_build(self) -> None:
+        # `pio project metadata` cleans the build directory whenever it changes
+        # PlatformIO's project checksum — resolving a dependency the build had
+        # not is enough — so collecting it after `pio run` deletes the
+        # firmware.bin about to be staged. RaceLink_WLED hit exactly that.
         metadata = self.source.index("--json-output-path metadata.json")
+        build = self.source.index("python -m platformio run")
         staging = self.source.index("scripts/stage_release_artifacts.py")
 
-        self.assertLess(metadata, staging, "Staging reads metadata.json before it is written")
+        self.assertLess(metadata, build, "project metadata must run before the build")
+        self.assertLess(build, staging, "staging needs the built firmware")
 
     def test_staging_is_delegated_to_the_tested_script(self) -> None:
         self.assertIn("python scripts/stage_release_artifacts.py", self.source)
