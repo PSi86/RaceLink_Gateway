@@ -178,6 +178,25 @@ class NamingTests(unittest.TestCase):
         )
         self.assertIn("usb-serial-only", name)
 
+    def test_variant_states_the_upstream_release_a_build_wraps(self) -> None:
+        name = artifact_name(
+            product="RaceLink_WLED",
+            version="0.1.8",
+            env="RaceLink_Node_v4_s3_llcc68",
+            kind=APP_KIND,
+            dev_type=12,
+            variant="wled_v0.15.3",
+        )
+
+        self.assertEqual(
+            name,
+            "RaceLink_WLED-0.1.8-RaceLink_Node_v4_s3_llcc68-TYPE12-wled_v0.15.3-app.bin",
+        )
+        # Both versions have to stay readable: the RaceLink release and the
+        # upstream WLED release it was built against.
+        self.assertIn("-0.1.8-", name)
+        self.assertIn("wled_v0.15.3", name)
+
     def test_pre_application_images_carry_no_device_type(self) -> None:
         self.assertEqual(
             artifact_name(
