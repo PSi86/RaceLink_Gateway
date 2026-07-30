@@ -31,11 +31,19 @@ host machine.
 
 ## Hardware target
 
-Currently a single PlatformIO environment:
+Two PlatformIO environments, both ESP32-S3 + SX1262 + SSD1306 OLED
+sharing an identical radio / OLED-I2C / Vext / button pin map:
 
-* `WirelessStickV3-ESP32S3` (ESP32-S3 + SX1262 + SSD1306 OLED)
+* `WirelessStickV3-ESP32S3` — Heltec Wireless Stick V3, 0.49" 64×32 OLED
+* `HeltecWiFiLoRa32V4-ESP32S3` — Heltec WiFi LoRa 32 V4 (V4.3), 0.96" 128×64 OLED
 
-Compile-time defines:
+The only per-board difference is the OLED panel geometry, selected at
+compile time via the `OLED_GEOMETRY_64X32` / `OLED_GEOMETRY_128X64`
+build flag (see [`platformio.ini`](platformio.ini)); `src/main.cpp`
+switches the U8g2 constructor and status/debug layout accordingly.
+Build the V4 with `pio run -e HeltecWiFiLoRa32V4-ESP32S3`.
+
+Compile-time defines (shared by both environments):
 
 * `DEV_TYPE=1`
 * `DEV_TYPE_STR="RaceLink_Gateway_v4"`

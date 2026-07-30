@@ -265,10 +265,20 @@ static inline bool try_schedule_or_nack(RaceLinkTransport::Core& rl,
 }
 
 /************ OLED (U8g2) ************/
-// SSD1306 64x32 (UNIVISION) Full buffer, HW I2C
-//SSD1306 64X32_NONAME: https://github.com/olikraus/u8g2/wiki/u8g2setupcpp#ssd1306-64x32_1f-1
-//Full Frame Buffer and Pin Definitions:
+// Panel geometry is selected at compile time via the OLED_GEOMETRY_* build
+// flag (see platformio.ini). Both supported gateway boards are SSD1306 over
+// HW I2C and share the same pin map; they differ only in panel size:
+//   * Heltec Wireless Stick V3 : 0.49" 64x32  (UNIVISION)
+//   * Heltec WiFi LoRa 32 V4    : 0.96" 128x64 (NONAME)
+// Full frame buffer (F) in both cases so the status/debug renderers can
+// clear + redraw the whole panel. Default (no flag) = 64x32 to preserve the
+// original Wireless Stick behaviour.
+// u8g2 setup reference: https://github.com/olikraus/u8g2/wiki/u8g2setupcpp
+#if defined(OLED_GEOMETRY_128X64)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST);
+#else
 U8G2_SSD1306_64X32_1F_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST);
+#endif
 
 /************ MAC ************/
 // racelink_transport_core.h enthält jetzt die MAC-bezogenen Elemente (rl.myMac6, rl.myLast3, rl.macReadOK)
@@ -381,6 +391,27 @@ void drawStatusInternal() {
   snprintf(lineRX, sizeof(lineRX), "RX:%u", rl.rxCountFiltered);
 
   u8g2.clearBuffer();
+
+#if defined(OLED_GEOMETRY_128X64)
+  // 0.96" 128x64 panel (WiFi LoRa 32 V4): title bar + two large counter
+  // lines spread over the full height. The active RF direction is bold.
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.drawStr(0, 10, "RaceLink GW");
+  u8g2.drawHLine(0, 13, u8g2.getDisplayWidth());
+
+  // y-Koordinaten sind Baselines
+  u8g2.setFont(u8g2_font_9x15_mf);
+  if (rl.rfMode == RaceLinkTransport::Mode::Tx) {
+    drawStringBold(0, 38, lineTX);
+    u8g2.drawStr(0, 60, lineRX);
+  } else if (rl.rfMode == RaceLinkTransport::Mode::Rx) {
+    u8g2.drawStr(0, 38, lineTX);
+    drawStringBold(0, 60, lineRX);
+  } else {
+    u8g2.drawStr(0, 38, lineTX);
+    u8g2.drawStr(0, 60, lineRX);
+  }
+#else
   u8g2.setFont(u8g2_font_9x15_mf);     // ~15px Zeilenhöhe -> 2 Zeilen passen in 32px
 
   // y-Koordinaten sind Baselines
@@ -394,6 +425,7 @@ void drawStatusInternal() {
     u8g2.drawStr(0, 14, lineTX);
     u8g2.drawStr(0, 31, lineRX);
   }
+#endif
   u8g2.sendBuffer();
 }
 
@@ -445,16 +477,29 @@ void drawDebugInternal() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_mf);
 
-  // Kopfzeile: Länge (currently disabled visually, kept for future)
+  // Kopfzeile: Länge
   char hdr[22];
   snprintf(hdr, sizeof(hdr), "LAST %uB", local_len);
-  //u8g2.drawStr(0, 10, hdr);
 
-  const uint8_t perLine = 4;                  // passt in die Breite (21 Zeichen)
-  char line[22];                               // max 21 chars + \0
+#if defined(OLED_GEOMETRY_128X64)
+  // 0.96" 128x64: header + up to 5 lines of 7 bytes (35 B, covers the 32 B
+  // max forwarded frame). 7 bytes = "FF FF FF FF FF FF FF" = 20 chars * 6px
+  // = 120px, fits the 128px width.
+  u8g2.drawStr(0, 10, hdr);
+  u8g2.drawHLine(0, 13, u8g2.getDisplayWidth());
+  const uint8_t perLine  = 7;
+  const uint8_t maxLines = 5;
+  uint8_t y = 24;
+#else
+  // 0.49" 64x32: no room for the header; 3 lines of 4 bytes (12 B visible).
+  (void)hdr;
+  const uint8_t perLine  = 4;                  // passt in die Breite (21 Zeichen)
+  const uint8_t maxLines = 3;
   uint8_t y = 10; //22
+#endif
 
-  for (uint8_t i = 0; i < 3 && i * perLine < local_len; ++i) {
+  char line[24];                               // max 21 chars + \0
+  for (uint8_t i = 0; i < maxLines && i * perLine < local_len; ++i) {
     const uint8_t start = i * perLine;
     const uint8_t count = (local_len - start > perLine) ? perLine : (local_len - start);
 
