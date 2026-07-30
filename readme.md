@@ -85,10 +85,17 @@ RaceLink_Gateway/
 │   ├── racelink_proto.h        ← byte-identical to Host + WLED
 │   └── racelink_transport_core.h
 ├── test/
+├── partitions/
+│   └── racelink_gateway_8MB.csv  pinned flash layout, app0 @ 0x10000
 ├── platformio.ini
 ├── README.md
 └── LICENSE
 ```
+
+The platform version and the partition table are both pinned in
+[`platformio.ini`](platformio.ini): releases publish images that name concrete
+flash offsets, so neither may drift between two releases.
+`tests/test_partition_table.py` fails if they do.
 
 ## Dependencies
 
