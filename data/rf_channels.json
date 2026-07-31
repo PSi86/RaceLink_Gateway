@@ -1,0 +1,133 @@
+{
+  "$comment": [
+    "Mirrored from RaceLink_Host/racelink/domain/rf_channels.py, which stays the source of truth.",
+    "Vendored here because the firmware needs the table for three things the host cannot do for it:",
+    "the channel dropdown in the WLED usermod settings, the info line, and the band lock.",
+    "",
+    "racelink_rf_channels.h is GENERATED from this file by scripts/generate_rf_channels.py;",
+    "tests/test_rf_channels.py regenerates and compares, so the header cannot drift from the table.",
+    "The release publishes this file verbatim as `rf_channels` in the assets.json sidecar, which is",
+    "how the web flasher offers exactly the channels the selected firmware version understands.",
+    "",
+    "There is deliberately no 433 MHz region: the host does not define one, and",
+    "RfConfigNvs::validate() rejects anything outside 863-928 MHz."
+  ],
+  "minSeparationHz": 500000,
+  "maxChannelsPerRegion": 5,
+  "regions": {
+    "EU868": [
+      {
+        "id": 1,
+        "name": "Default",
+        "freq_hz": 867700000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      },
+      {
+        "id": 2,
+        "name": "Alt-1",
+        "freq_hz": 868200000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      },
+      {
+        "id": 3,
+        "name": "Alt-2",
+        "freq_hz": 868700000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      },
+      {
+        "id": 4,
+        "name": "Alt-3",
+        "freq_hz": 869200000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      },
+      {
+        "id": 5,
+        "name": "High",
+        "freq_hz": 869700000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      }
+    ],
+    "US915": [
+      {
+        "id": 1,
+        "name": "Default",
+        "freq_hz": 904300000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      },
+      {
+        "id": 2,
+        "name": "Alt-1",
+        "freq_hz": 905300000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      },
+      {
+        "id": 3,
+        "name": "Alt-2",
+        "freq_hz": 906300000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      },
+      {
+        "id": 4,
+        "name": "Alt-3",
+        "freq_hz": 907300000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      },
+      {
+        "id": 5,
+        "name": "High",
+        "freq_hz": 908300000,
+        "bw_khz_x10": 1250,
+        "sf": 7,
+        "cr_den": 5,
+        "sync_word": 18,
+        "tx_power_dbm": 14,
+        "preamble": 8
+      }
+    ]
+  }
+}

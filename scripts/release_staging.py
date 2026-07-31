@@ -176,6 +176,23 @@ def stage_environment(
     return entry
 
 
+def rf_channel_table(repo_root: Path) -> dict | None:
+    """The channel table this firmware understands, or None if it ships none.
+
+    Published so the web flasher offers exactly the channels the *selected*
+    version knows about. A channel added later must not be offered for an
+    older release: the firmware would store it, fail to recognise it, and the
+    node would sit on a frequency nothing else uses.
+
+    Same reasoning as ``led_defaults`` — the build states what it supports,
+    rather than a consumer guessing from a version number.
+    """
+    table = repo_root / "data" / "rf_channels.json"
+    if not table.is_file():
+        return None
+    return json.loads(table.read_text(encoding="utf-8"))
+
+
 def write_release_index(
     *,
     dist_dir: Path,
@@ -194,6 +211,9 @@ def write_release_index(
         raise SystemExit("No environments were staged")
 
     manifest = {"product": product, "version": version, **(extra or {})}
+    channels = rf_channel_table(Path(__file__).resolve().parents[1])
+    if channels is not None:
+        manifest["rf_channels"] = channels
     manifest["environments"] = environments
     manifest_path = dist_dir / manifest_name(product, version)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
