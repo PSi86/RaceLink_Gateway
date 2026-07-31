@@ -131,6 +131,7 @@ jobs:
       - name: Verify the staged factory images
         run: |
           python - <<'PY'
+          import hashlib
           import json
           from pathlib import Path
 
@@ -139,12 +140,16 @@ jobs:
           )
           for environment in manifest["environments"]:
               assets = {asset["kind"]: asset for asset in environment["assets"]}
+              # The bootloader, partition table and OTA selector are merged
+              # into the factory image but no longer published, so their
+              # offsets come from `parts`, not from a staged file of their own.
+              parts = {part["kind"]: part for part in environment["parts"]}
               image = (Path("dist") / assets["factory"]["file"]).read_bytes()
               app_offset = environment["app_offset"]
 
               expectations = [
-                  (assets["bootloader"]["offset"], b"\xe9", "bootloader"),
-                  (assets["partitions"]["offset"], b"\xaa\x50", "partition table"),
+                  (parts["bootloader"]["offset"], b"\xe9", "bootloader"),
+                  (parts["partitions"]["offset"], b"\xaa\x50", "partition table"),
                   (app_offset, b"\xe9", "application"),
               ]
               for offset, magic, label in expectations:
@@ -153,6 +158,17 @@ jobs:
                       raise SystemExit(
                           f"{environment['env']}: no {label} at 0x{offset:x} "
                           f"(found {found.hex()}, expected {magic.hex()})"
+                      )
+
+              # `parts` is now the only record of these blocks, so prove it
+              # describes the image rather than merely accompanying it.
+              for kind, part in sorted(parts.items()):
+                  block = image[part["offset"] : part["offset"] + part["size"]]
+                  if hashlib.sha256(block).hexdigest() != part["sha256"]:
+                      raise SystemExit(
+                          f"{environment['env']}: the {kind} block at "
+                          f"0x{part['offset']:x} does not match the SHA-256 the "
+                          "sidecar states for it"
                       )
 
               published = (Path("dist") / assets["app"]["file"]).read_bytes()
