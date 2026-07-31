@@ -8,12 +8,25 @@ gateway iterates a flat environment list, RaceLink_WLED stages one profile at a
 time into an external WLED checkout — but not in what a staged environment
 looks like.
 
-Produced per environment:
+Produced per environment, two files:
 
-* the application image, which is what OTA and the host's firmware dialog take,
-* the three pre-application images (bootloader, partition table, boot_app0), so
-  a blank chip can be commissioned without a local toolchain,
-* a merged factory image covering all four, written at offset 0.
+* ``<env>-<version>-ota.bin`` -- the application image, which is what OTA and
+  the host's firmware dialog take,
+* ``<env>-<version>-usbflash.bin`` -- bootloader, partition table, OTA selector
+  and application merged into one image, written at offset 0.
+
+The three pre-application images are still merged into the factory image, but
+they are no longer published on their own. They were 60% of a release's files
+and about 1% of its bytes, every one of them a byte-for-byte copy of something
+the factory image already contains -- and in a six-target release the eighteen
+of them held only five distinct payloads. ``esptool write_flash 0x0
+<…-usbflash.bin>`` reaches the same state in one write, with no per-SoC
+bootloader offset to get wrong, which was the one number that route asked
+somebody to look up.
+
+What those files carried that was worth keeping -- where each block sits, how
+big it is and what it hashes to -- is now the ``parts`` list in the sidecar. It
+costs no files at all.
 """
 
 from __future__ import annotations
@@ -30,7 +43,6 @@ from scripts.release_artifacts import (
     application_offset,
     artifact_name,
     bootloader_offset_for_chip,
-    checksum_name,
     device_type,
     flash_images_from_metadata,
     manifest_name,
@@ -39,8 +51,9 @@ from scripts.release_artifacts import (
     read_chip_name,
 )
 
-# PlatformIO names the pre-application images by file; map them to the asset
-# kind so the sidecar reads as intent rather than as a filename.
+# PlatformIO names the pre-application images by file; map them to the block
+# name so the sidecar reads as intent rather than as a build-directory
+# filename.
 PART_KINDS = {
     "bootloader.bin": "bootloader",
     "partitions.bin": "partitions",
@@ -63,14 +76,12 @@ def _stage(source: Path, target: Path) -> Path:
 def stage_environment(
     *,
     env: str,
-    product: str,
     version: str,
     build_dir: Path,
     dist_dir: Path,
     metadata: dict,
-    variant: str | None = None,
 ) -> dict:
-    """Stage every asset for one environment and return its manifest entry."""
+    """Stage both published assets for one environment and return its sidecar entry."""
     firmware = build_dir / "firmware.bin"
     if not firmware.is_file():
         raise SystemExit(f"Expected firmware artifact not found: {firmware}")
@@ -115,49 +126,44 @@ def stage_environment(
 
     app_target = _stage(
         firmware,
-        dist_dir
-        / artifact_name(
-            product=product,
-            version=version,
-            env=env,
-            kind=APP_KIND,
-            dev_type=dev_type,
-            variant=variant,
-        ),
+        dist_dir / artifact_name(version=version, env=env, kind=APP_KIND),
     )
     record(app_target, APP_KIND, app_offset)
 
+    # The pre-application images go into the merge but not into the release.
+    # `parts` keeps the layout on the record -- which block sits where, how big
+    # it is, what it hashes to -- so the information those three files used to
+    # carry survives without shipping them. The fourth block is the
+    # application, at `app_offset`, published in its own right above.
+    parts: list[dict] = []
     merge_inputs: list[tuple[int, str]] = [(app_offset, str(firmware))]
     for image in flash_images:
         source = Path(image.path)
         kind = PART_KINDS.get(source.name)
         if kind is None:
             raise SystemExit(f"{env}: unexpected flash image {source.name}")
-        target = _stage(
-            source,
-            dist_dir / artifact_name(product=product, version=version, env=env, kind=kind),
+        parts.append(
+            {
+                "kind": kind,
+                "offset": image.offset,
+                "size": source.stat().st_size,
+                "sha256": sha256_of(source),
+            }
         )
-        record(target, kind, image.offset)
         merge_inputs.append((image.offset, str(source)))
 
-    factory_target = dist_dir / artifact_name(
-        product=product,
-        version=version,
-        env=env,
-        kind=FACTORY_KIND,
-        dev_type=dev_type,
-        variant=variant,
-    )
+    factory_target = dist_dir / artifact_name(version=version, env=env, kind=FACTORY_KIND)
     command = merge_command(chip=chip, output=str(factory_target), images=merge_inputs)
     print(" ".join(command), flush=True)
     subprocess.run(command, check=True)
-    record(factory_target, "factory", 0)
+    record(factory_target, FACTORY_KIND, 0)
 
     return {
         "env": env,
         "chip": chip,
         "dev_type": dev_type,
         "app_offset": app_offset,
+        "parts": sorted(parts, key=lambda part: part["offset"]),
         "assets": assets,
     }
 
@@ -169,8 +175,13 @@ def write_release_index(
     version: str,
     environments: list[dict],
     extra: dict | None = None,
-) -> tuple[Path, Path]:
-    """Write the assets.json sidecar and the SHA-256 manifest."""
+) -> Path:
+    """Write the assets.json sidecar.
+
+    There is no companion sha256.txt any more. It restated, in a second format,
+    exactly the digests this file already carries per asset -- and nothing read
+    it that could not read this one just as easily.
+    """
     if not environments:
         raise SystemExit("No environments were staged")
 
@@ -178,13 +189,4 @@ def write_release_index(
     manifest["environments"] = environments
     manifest_path = dist_dir / manifest_name(product, version)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
-    checksum_lines = [
-        f"{asset['sha256']}  {asset['file']}"
-        for environment in environments
-        for asset in environment["assets"]
-    ]
-    checksum_path = dist_dir / checksum_name(product, version)
-    checksum_path.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
-
-    return manifest_path, checksum_path
+    return manifest_path

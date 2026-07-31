@@ -16,10 +16,10 @@ from scripts.release_artifacts import (
     BOOTLOADER_OFFSETS,
     CHIP_NAMES,
     FACTORY_KIND,
+    FILENAME_TOKENS,
     application_offset,
     artifact_name,
     bootloader_offset_for_chip,
-    checksum_name,
     device_type,
     flash_images_from_metadata,
     manifest_name,
@@ -151,69 +151,68 @@ class MetadataTests(unittest.TestCase):
 
 
 class NamingTests(unittest.TestCase):
-    def test_application_image_name(self) -> None:
+    def test_the_two_published_names(self) -> None:
         self.assertEqual(
-            artifact_name(
-                product="RaceLink_Gateway",
-                version="0.1.6",
-                env="WirelessStickV3-ESP32S3",
-                kind=APP_KIND,
-                dev_type=1,
-            ),
-            "RaceLink_Gateway-0.1.6-WirelessStickV3-ESP32S3-TYPE1-app.bin",
-        )
-
-    def test_factory_image_name_reads_as_a_warning(self) -> None:
-        name = artifact_name(
-            product="RaceLink_Gateway",
-            version="0.1.6",
-            env="WirelessStickV3-ESP32S3",
-            kind=FACTORY_KIND,
-            dev_type=1,
-        )
-
-        self.assertEqual(
-            name,
-            "RaceLink_Gateway-0.1.6-WirelessStickV3-ESP32S3-TYPE1-factory-usb-serial-only.bin",
-        )
-        self.assertIn("usb-serial-only", name)
-
-    def test_variant_states_the_upstream_release_a_build_wraps(self) -> None:
-        name = artifact_name(
-            product="RaceLink_WLED",
-            version="0.1.8",
-            env="RaceLink_Node_v4_s3_llcc68",
-            kind=APP_KIND,
-            dev_type=12,
-            variant="wled_v0.15.3",
-        )
-
-        self.assertEqual(
-            name,
-            "RaceLink_WLED-0.1.8-RaceLink_Node_v4_s3_llcc68-TYPE12-wled_v0.15.3-app.bin",
-        )
-        # Both versions have to stay readable: the RaceLink release and the
-        # upstream WLED release it was built against.
-        self.assertIn("-0.1.8-", name)
-        self.assertIn("wled_v0.15.3", name)
-
-    def test_pre_application_images_carry_no_device_type(self) -> None:
-        self.assertEqual(
-            artifact_name(
-                product="RaceLink_Gateway",
-                version="0.1.6",
-                env="WirelessStickV3-ESP32S3",
-                kind="bootloader",
-            ),
-            "RaceLink_Gateway-0.1.6-WirelessStickV3-ESP32S3-bootloader.bin",
-        )
-
-    def test_sidecar_names(self) -> None:
-        self.assertEqual(
-            checksum_name("RaceLink_Gateway", "0.1.6"), "RaceLink_Gateway-0.1.6-sha256.txt"
+            artifact_name(version="0.1.7", env="WirelessStickV3-ESP32S3", kind=APP_KIND),
+            "WirelessStickV3-ESP32S3-0.1.7-ota.bin",
         )
         self.assertEqual(
-            manifest_name("RaceLink_Gateway", "0.1.6"), "RaceLink_Gateway-0.1.6-assets.json"
+            artifact_name(version="0.1.7", env="WirelessStickV3-ESP32S3", kind=FACTORY_KIND),
+            "WirelessStickV3-ESP32S3-0.1.7-usbflash.bin",
+        )
+
+    def test_the_two_names_cannot_be_confused(self) -> None:
+        # Forcing the factory image through an OTA path is the one mistake with
+        # a real cost, so neither name may contain the other -- a glob or a
+        # glance for one must never land on the other.
+        app = artifact_name(version="0.1.7", env="WirelessStickV3-ESP32S3", kind=APP_KIND)
+        factory = artifact_name(version="0.1.7", env="WirelessStickV3-ESP32S3", kind=FACTORY_KIND)
+
+        self.assertNotIn(FILENAME_TOKENS[APP_KIND], factory)
+        self.assertNotIn(FILENAME_TOKENS[FACTORY_KIND], app)
+
+    def test_the_environment_is_spelled_out_verbatim(self) -> None:
+        # The env is the key the sidecar, the build configuration and the web
+        # flasher's data/devices.json already agree on. Abbreviating it here
+        # would introduce a fourth spelling, and an abbreviation rule is what
+        # starts colliding the day a target is added.
+        for env in ("RaceLink_Node_v3_s2_llcc68_epaper", "WirelessStickV3-ESP32S3"):
+            with self.subTest(env=env):
+                name = artifact_name(version="0.1.9", env=env, kind=APP_KIND)
+                self.assertTrue(name.startswith(f"{env}-"))
+
+    def test_the_name_carries_no_product_device_type_or_upstream_ref(self) -> None:
+        name = artifact_name(version="0.1.9", env="RaceLink_Node_v4_s3_llcc68", kind=APP_KIND)
+
+        self.assertEqual(name, "RaceLink_Node_v4_s3_llcc68-0.1.9-ota.bin")
+        # All three are in the assets.json sidecar. Repeating them in the
+        # filename was about half its length, for fields nobody was meant to
+        # read off a filename in the first place.
+        for absent in ("RaceLink_WLED-", "TYPE12", "wled_v"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, name)
+
+    def test_the_version_stays_in_the_name(self) -> None:
+        # The tag identifies it on the release page; the filename has to keep
+        # doing so once it is sitting in somebody's Downloads folder.
+        self.assertIn("-0.1.9-", artifact_name(version="0.1.9", env="env", kind=APP_KIND))
+
+    def test_rejects_a_kind_without_a_filename_token(self) -> None:
+        # A newly published kind has to name itself deliberately rather than
+        # inherit whatever its sidecar value happens to be.
+        with self.assertRaises(ValueError):
+            artifact_name(version="0.1.7", env="WirelessStickV3-ESP32S3", kind="bootloader")
+
+    def test_sidecar_kinds_are_the_machine_contract(self) -> None:
+        # The web flasher selects the image it mirrors on kind == "factory".
+        # These values are independent of the filename tokens above and must
+        # not move when a name changes.
+        self.assertEqual(APP_KIND, "app")
+        self.assertEqual(FACTORY_KIND, "factory")
+
+    def test_sidecar_name(self) -> None:
+        self.assertEqual(
+            manifest_name("RaceLink_Gateway", "0.1.7"), "RaceLink_Gateway-0.1.7-assets.json"
         )
 
 

@@ -179,45 +179,53 @@ def device_type(defines: Iterable[str]) -> int | None:
 
 # --- Artifact naming ------------------------------------------------------
 #
-# Field order: product, release version, environment, device type, variant,
-# kind. The kind goes last because it is the most visible token in a file
-# picker, and the factory image must never be mistaken for something OTA-able.
-# The three pre-application images carry neither device type nor variant — they
-# are build by-products of the environment, not firmware identity.
+# A release publishes two files per environment:
 #
-# `variant` carries the upstream version a build was made against, so a
-# RaceLink_WLED asset states both its own release and the WLED release it wraps
-# ("wled_v0.15.3"). Fields never contain "-", so the name stays parseable, but
-# consumers should read the assets.json sidecar rather than the filename.
+#     <env>-<version>-ota.bin        the application alone
+#     <env>-<version>-usbflash.bin   the merged factory image, written at 0x0
+#
+# Three fields are deliberately absent that earlier releases carried: the
+# product, the device type, and the upstream WLED release a build wraps. All
+# three are in the assets.json sidecar, and the product is implied by the
+# release the file hangs under. Together they were about half the length of
+# every name, for information nobody was supposed to read off a filename.
+#
+# The environment is spelled out verbatim rather than abbreviated. It is the
+# key that the sidecar, the build configuration and the web flasher's
+# data/devices.json all already agree on; an abbreviated spelling would be a
+# fourth one, and an abbreviation rule is something that can start colliding
+# the day a new target is added.
+#
+# The two tokens name the *action*, not the build step that produced the file.
+# These are the only two files a person chooses between, and the one mistake
+# with a real cost is forcing a factory image through an OTA path: it lands in
+# the inactive slot and bricks the device. "ota" beside "usbflash" makes that
+# hard to reach by accident, which "app" beside "factory-usb-serial-only"
+# achieved only for whoever read the release notes first.
 
-FACTORY_KIND = "factory-usb-serial-only"
+# Sidecar `kind` values -- the machine-readable contract. Consumers select on
+# these (the web flasher looks for "factory"), so they are deliberately
+# independent of the filename tokens below and do not move with a naming
+# decision.
 APP_KIND = "app"
+FACTORY_KIND = "factory"
+
+FILENAME_TOKENS = {APP_KIND: "ota", FACTORY_KIND: "usbflash"}
 
 
-def artifact_name(
-    *,
-    product: str,
-    version: str,
-    env: str,
-    kind: str,
-    dev_type: int | None = None,
-    variant: str | None = None,
-    extension: str = ".bin",
-) -> str:
-    parts = [product, version, env]
-    if dev_type is not None:
-        parts.append(f"TYPE{dev_type}")
-    if variant is not None:
-        parts.append(variant)
-    parts.append(kind)
-    return "-".join(parts) + extension
-
-
-def checksum_name(product: str, version: str) -> str:
-    return f"{product}-{version}-sha256.txt"
+def artifact_name(*, version: str, env: str, kind: str, extension: str = ".bin") -> str:
+    try:
+        token = FILENAME_TOKENS[kind]
+    except KeyError:
+        raise ValueError(
+            f"No filename token for kind {kind!r}. Every published kind needs "
+            "one; add it to FILENAME_TOKENS."
+        ) from None
+    return f"{env}-{version}-{token}{extension}"
 
 
 def manifest_name(product: str, version: str) -> str:
+    """The sidecar describes the release as a whole, so it keeps the product."""
     return f"{product}-{version}-assets.json"
 
 

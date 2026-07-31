@@ -40,13 +40,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("--metadata metadata.json", self.source)
 
     def test_every_staged_asset_is_published(self) -> None:
-        # A narrower glob is how the factory images, the pre-application images
-        # or the assets.json sidecar would silently fail to ship.
+        # A narrower glob is how the factory images or the assets.json sidecar
+        # would silently fail to ship.
         self.assertIn("files: dist/*", self.source)
         self.assertIn("path: dist/*", self.source)
 
     def test_release_notes_warn_about_the_factory_image(self) -> None:
         self.assertIn("USB serial only", self.source)
+
+    def test_release_notes_do_not_promise_files_that_no_longer_ship(self) -> None:
+        # The bootloader, partition table and OTA selector are merged into the
+        # factory image and no longer published on their own. Notes that still
+        # list them send people looking for assets that are not there.
+        for gone in ("-bootloader.bin", "-partitions.bin", "-boot_app0.bin", "-sha256.txt"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, self.source)
 
     def test_tests_run_before_anything_is_published(self) -> None:
         tests = self.source.index('python -m unittest discover -s tests -p "test_*.py"')

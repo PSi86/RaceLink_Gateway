@@ -5,10 +5,9 @@ its RaceLink_WLED counterpart. The repositories differ only in how they iterate:
 the gateway has a flat list of environments, RaceLink_WLED stages one profile at
 a time into an external WLED checkout.
 
-Produced per environment: the application image, the three pre-application
-images, and a merged factory image — plus one SHA-256 manifest and one
-``…-assets.json`` sidecar describing every file, so consumers never have to
-parse filenames.
+Produced per environment: the application image and a merged factory image —
+plus one ``…-assets.json`` sidecar describing every file, so consumers never
+have to parse filenames.
 """
 
 from __future__ import annotations
@@ -48,7 +47,6 @@ def main() -> int:
     environments = [
         stage_environment(
             env=env,
-            product=args.product,
             version=args.version,
             build_dir=args.build_root / env,
             dist_dir=args.dist_dir,
@@ -57,7 +55,7 @@ def main() -> int:
         for env in args.envs
     ]
 
-    manifest_path, checksum_path = write_release_index(
+    manifest_path = write_release_index(
         dist_dir=args.dist_dir,
         product=args.product,
         version=args.version,
@@ -66,7 +64,7 @@ def main() -> int:
 
     staged = sum(len(environment["assets"]) for environment in environments)
     print(f"Staged {staged} artifacts into {args.dist_dir}")
-    print(f"  {manifest_path.name}\n  {checksum_path.name}")
+    print(f"  {manifest_path.name}")
     return 0
 
 

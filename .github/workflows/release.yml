@@ -123,11 +123,12 @@ jobs:
             echo "::endgroup::"
           done
 
-      # Stages, per environment: the application image, the three
-      # pre-application images (so a blank chip can be commissioned without a
-      # local toolchain), and a merged factory image for USB flashing and the
-      # web flasher -- plus a SHA-256 manifest and an assets.json sidecar that
-      # spares consumers from parsing filenames. See scripts/release_artifacts.py.
+      # Stages two files per environment: the application image, and a merged
+      # factory image for USB flashing and the web flasher -- plus an
+      # assets.json sidecar that spares consumers from parsing filenames. The
+      # bootloader, partition table and OTA selector go into the merge but are
+      # not published on their own; the sidecar's `parts` list records where
+      # each of them sits. See scripts/release_artifacts.py.
       - name: Stage release artifacts
         env:
           RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
@@ -172,20 +173,31 @@ jobs:
           body: |
             ### Flashing
 
-            * `…-TYPE1-app.bin` — application image. This is the file for OTA
-              updates and for the host's firmware-update dialog.
-            * `…-TYPE1-factory-usb-serial-only.bin` — bootloader, partition
-              table, OTA selector and application in one image, written at
-              offset `0x0`. **USB serial only.** Sent over OTA it is rejected in
-              the normal case, but with firmware validation disabled it is
-              written into the inactive slot and bricks the device until someone
-              re-flashes over serial. It also rewrites the partition table, so
-              every persisted setting is erased — a commissioning tool, never an
-              update tool. Requires a chip with at least 8 MB of flash.
-            * `…-bootloader.bin` / `…-partitions.bin` / `…-boot_app0.bin` — the
-              individual pieces, for flashing a blank chip manually.
-            * `…-assets.json` — machine-readable index: kind, flash offset, size
-              and SHA-256 for every file above.
+            The easiest route for a blank board is the web flasher at
+            <https://fw.racelink.dev/>, which picks the right image for the
+            model and sets the radio channel while it writes. The files below
+            are for flashing by hand.
+
+            * `<env>-<version>-ota.bin` — application image. This is the file
+              for OTA updates and for the host's firmware-update dialog.
+            * `<env>-<version>-usbflash.bin` — bootloader, partition table, OTA
+              selector and application in one image, written at offset `0x0`.
+              **USB serial only.** Sent over OTA it is rejected in the normal
+              case, but with firmware validation disabled it is written into the
+              inactive slot and bricks the device until someone re-flashes over
+              serial. It also rewrites the partition table, so every persisted
+              setting is erased — a commissioning tool, never an update tool.
+              Requires a chip with at least 8 MB of flash.
+            * `…-assets.json` — machine-readable index: environment, chip,
+              device type, flash offset, size and SHA-256 for every file, plus
+              a `parts` list giving the layout of the blocks merged into the
+              factory image.
+
+            Filenames no longer repeat the product, the device type or the
+            checksum file; every one of those is in `…-assets.json`. The
+            bootloader, partition table and OTA selector are no longer published
+            separately — `esptool write_flash 0x0 <env>-<version>-usbflash.bin`
+            reaches the same state in one write.
           files: dist/*
 
       - name: Write workflow summary
