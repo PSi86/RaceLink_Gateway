@@ -45,6 +45,7 @@ from scripts.release_artifacts import (
     bootloader_offset_for_chip,
     device_type,
     flash_images_from_metadata,
+    led_defaults,
     manifest_name,
     merge_command,
     parse_partition_table,
@@ -110,7 +111,11 @@ def stage_environment(
             f"0x{expected_offset:x}. Refusing to publish a factory image."
         )
 
-    dev_type = device_type(env_metadata.get("defines") or [])
+    defines = env_metadata.get("defines") or []
+    dev_type = device_type(defines)
+    # What this build drives if nothing is seeded. Absent for the gateway,
+    # which is also how the flasher knows not to offer an LED step for it.
+    leds = led_defaults(defines)
     assets: list[dict] = []
 
     def record(path: Path, kind: str, offset: int) -> None:
@@ -158,7 +163,7 @@ def stage_environment(
     subprocess.run(command, check=True)
     record(factory_target, FACTORY_KIND, 0)
 
-    return {
+    entry = {
         "env": env,
         "chip": chip,
         "dev_type": dev_type,
@@ -166,6 +171,9 @@ def stage_environment(
         "parts": sorted(parts, key=lambda part: part["offset"]),
         "assets": assets,
     }
+    if leds is not None:
+        entry["led_defaults"] = leds
+    return entry
 
 
 def write_release_index(

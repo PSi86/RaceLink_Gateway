@@ -177,6 +177,73 @@ def device_type(defines: Iterable[str]) -> int | None:
     return int(raw, 0)
 
 
+# Clocked LED types, which take a data *and* a clock pin. Named rather than
+# numbered because that is how a build profile spells them.
+TWO_PIN_LED_TYPES = frozenset(
+    {"TYPE_WS2801", "TYPE_APA102", "TYPE_LPD8806", "TYPE_P9813", "TYPE_LPD6803"}
+)
+
+
+def _int_list(raw: str | None) -> list[int]:
+    return [int(part.strip(), 0) for part in raw.split(",") if part.strip()] if raw else []
+
+
+def led_defaults(defines: Iterable[str]) -> dict | None:
+    """The LED output this build was compiled with, or None if it drives none.
+
+    Published so the flasher can prefill its LED form from the build itself
+    rather than from a table somebody has to keep in step with the profiles.
+    A gateway defines none of these and gets no entry, which is also how the
+    flasher knows not to offer the step at all.
+
+    ``DATA_PINS``, ``LED_TYPES`` and ``PIXEL_COUNTS`` are per-bus lists that
+    WLED pads by repeating their last element (cfg.cpp), so they are expanded
+    here into one entry per bus — once, in the place that already reads the
+    build, rather than in each consumer.
+
+    **One entry per declared data pin, and no claim beyond that.** A profile's
+    ``-D WLED_MAX_BUSSES`` is deliberately not published: ``const.h`` ``#undef``\\ s
+    it and recomputes the value from the SoC's channel counts, so what the
+    profile says is documentation rather than the limit the firmware enforces.
+    The pin list is what the build genuinely configures, and it is what the
+    flasher offers.
+
+    Assumes one pin per bus, which every shipping profile satisfies: they all
+    build ``TYPE_WS2812_RGB``. A clocked type (APA102 and friends) takes two
+    pins per bus and would make this pairing wrong, so it is refused rather
+    than guessed at.
+    """
+    defines = list(defines)
+    pins = _int_list(define_value(defines, "DATA_PINS"))
+    if not pins:
+        return None
+
+    types = [t.strip() for t in (define_value(defines, "LED_TYPES") or "").split(",") if t.strip()]
+    counts = _int_list(define_value(defines, "PIXEL_COUNTS"))
+    if not types or not counts:
+        raise ValueError(
+            "DATA_PINS is set but LED_TYPES or PIXEL_COUNTS is not; the build "
+            "does not describe its LED output completely enough to publish."
+        )
+    if any(name in TWO_PIN_LED_TYPES for name in types):
+        raise ValueError(
+            f"LED_TYPES names a clocked type ({', '.join(types)}), which uses two "
+            "pins per bus. led_defaults pairs one pin per bus; teach it about "
+            "clocked types before releasing this profile."
+        )
+
+    return {
+        "buses": [
+            {
+                "pin": pin,
+                "type": types[min(i, len(types) - 1)],
+                "count": counts[min(i, len(counts) - 1)],
+            }
+            for i, pin in enumerate(pins)
+        ]
+    }
+
+
 # --- Artifact naming ------------------------------------------------------
 #
 # A release publishes two files per environment:

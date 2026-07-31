@@ -22,6 +22,7 @@ from scripts.release_artifacts import (
     bootloader_offset_for_chip,
     device_type,
     flash_images_from_metadata,
+    led_defaults,
     manifest_name,
     merge_command,
     parse_partition_table,
@@ -148,6 +149,91 @@ class MetadataTests(unittest.TestCase):
 
     def test_device_type_is_optional(self) -> None:
         self.assertIsNone(device_type(["PLATFORMIO=60119"]))
+
+
+class LedDefaultsTests(unittest.TestCase):
+    """The LED output a build drives, published so the flasher can prefill it.
+
+    The failure mode these guard is silent and lands on a bench: a form
+    prefilled with pins or a pixel count that is not what the firmware would
+    actually do if nothing were seeded.
+    """
+
+    NODE = [
+        "DEV_TYPE=11",
+        "DATA_PINS=2,11",
+        "LED_TYPES=TYPE_WS2812_RGB,TYPE_WS2812_RGB",
+        "PIXEL_COUNTS=100",
+        "WLED_MAX_BUSSES=2",
+    ]
+
+    def test_a_build_without_leds_has_no_entry(self) -> None:
+        # The gateway drives no strip; the absence is how the flasher knows
+        # not to offer the step at all.
+        self.assertIsNone(led_defaults(["DEV_TYPE=1", "PLATFORMIO=60119"]))
+
+    def test_expands_one_entry_per_bus(self) -> None:
+        # PIXEL_COUNTS names one value for two pins; WLED repeats the last
+        # element, and so does this.
+        self.assertEqual(
+            led_defaults(self.NODE),
+            {
+                "buses": [
+                    {"pin": 2, "type": "TYPE_WS2812_RGB", "count": 100},
+                    {"pin": 11, "type": "TYPE_WS2812_RGB", "count": 100},
+                ]
+            },
+        )
+
+    def test_a_single_output_board(self) -> None:
+        # RaceLink_Node_v1_c3_ct62 declares one data pin, so "up to two
+        # outputs" is not true everywhere and the flasher has to know.
+        result = led_defaults(
+            ["DATA_PINS=2", "LED_TYPES=TYPE_WS2812_RGB", "PIXEL_COUNTS=100", "WLED_MAX_BUSSES=1"]
+        )
+
+        self.assertEqual(len(result["buses"]), 1)
+
+    def test_the_profiles_max_busses_is_not_published(self) -> None:
+        # const.h #undefs -D WLED_MAX_BUSSES and recomputes it from the SoC's
+        # channel counts, so the profile's value is documentation, not the
+        # limit the firmware enforces. Publishing it would be a claim about
+        # the firmware that the firmware does not honour.
+        result = led_defaults(self.NODE)
+
+        self.assertNotIn("max_buses", result)
+
+    def test_per_bus_counts_are_kept_apart(self) -> None:
+        result = led_defaults(
+            [
+                "DATA_PINS=47,48",
+                "LED_TYPES=TYPE_WS2812_RGB,TYPE_SK6812_RGBW",
+                "PIXEL_COUNTS=60,144",
+                "WLED_MAX_BUSSES=2",
+            ]
+        )
+
+        self.assertEqual(
+            result["buses"],
+            [
+                {"pin": 47, "type": "TYPE_WS2812_RGB", "count": 60},
+                {"pin": 48, "type": "TYPE_SK6812_RGBW", "count": 144},
+            ],
+        )
+
+    def test_refuses_a_clocked_type(self) -> None:
+        # APA102 and friends take a data *and* a clock pin, so pairing one pin
+        # per bus would silently describe an output that cannot exist.
+        with self.assertRaises(ValueError):
+            led_defaults(
+                ["DATA_PINS=2,11", "LED_TYPES=TYPE_APA102", "PIXEL_COUNTS=100"]
+            )
+
+    def test_refuses_a_half_described_output(self) -> None:
+        # Publishing pins without a pixel count would prefill the form with a
+        # number nobody chose.
+        with self.assertRaises(ValueError):
+            led_defaults(["DATA_PINS=2,11", "LED_TYPES=TYPE_WS2812_RGB"])
 
 
 class NamingTests(unittest.TestCase):
