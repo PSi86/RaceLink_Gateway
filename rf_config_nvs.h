@@ -64,28 +64,6 @@ static const char* KEY_CONFIG    = "cfg";
 static const char* KEY_CRC       = "crc";
 static const char* KEY_BOOTCNT   = "bootcnt";
 
-// ---- Band lock ---------------------------------------------------------
-//
-// The band a board was built for -- 868 or 915 -- is a hardware property:
-// a differently populated LoRa module, and Heltec ships separate board
-// revisions for 863-870 and 902-928 MHz. Nothing over USB and nothing over
-// the air can detect which one is in front of you, which is why the
-// documentation could only ever warn about it.
-//
-// The web flasher does know: data/devices.json lists the bands a model is
-// sold in, and it makes the operator choose when there is more than one.
-// It writes that choice here once, at flash time, and from then on store()
-// refuses any configuration outside the band -- whoever asks: the WLED
-// settings page, a gateway over LoRa, or a later seed.
-//
-// Written only by the flasher, deliberately. There is no opcode and no UI
-// for it, because a lock the guarded thing can lift is not a lock.
-// Re-flashing changes it, which is right: repopulating a board is a
-// physical act too.
-//
-// Absent or 0 means unlocked -- what every device flashed before this
-// existed reports. The check then passes and nothing changes for them.
-static const char* KEY_BAND = "band";
 
 // ---- Channel identity --------------------------------------------------
 //
@@ -123,32 +101,6 @@ inline uint16_t crc16(const uint8_t* data, size_t n) {
   return crc;
 }
 
-// The ISM band a frequency falls in, or 0 for neither. The two windows are
-// the ones validate() already accepts; naming them here keeps this header
-// free of a dependency on the channel table, which not every consumer of
-// this file needs.
-inline uint16_t bandOf(uint32_t freq_hz) {
-  if (freq_hz >= 863000000UL && freq_hz <= 870000000UL) return 868;
-  if (freq_hz >= 902000000UL && freq_hz <= 928000000UL) return 915;
-  return 0;
-}
-
-// The band this board was flashed as, or 0 when unlocked.
-inline uint16_t lockedBand() {
-  Preferences prefs;
-  if (!prefs.begin(NVS_NAMESPACE, /*readOnly=*/true)) return 0;
-  const uint16_t band = prefs.isKey(KEY_BAND) ? prefs.getUShort(KEY_BAND, 0) : 0;
-  prefs.end();
-  return band;
-}
-
-// Whether a frequency may be written on this board. Unlocked boards accept
-// anything validate() accepts, which is the pre-band-lock behaviour.
-inline bool bandAllows(uint32_t freq_hz) {
-  const uint16_t locked = lockedBand();
-  return locked == 0 || bandOf(freq_hz) == locked;
-}
-
 // Range validator. Returns RF_CHANGE_OK on accept,
 // RF_CHANGE_REJECTED_RANGE otherwise. BW set mirrors the SX1262 / LLCC68
 // hardware-supported list (all values fit a uint16 x10 representation).
@@ -183,19 +135,9 @@ inline RaceLinkProto::RfChangeReason validate(const RaceLinkProto::P_RfConfig& c
 
 // Persist a validated config to NVS. Re-runs validate() defensively;
 // returns RF_CHANGE_REJECTED_RANGE if the caller skipped that step.
-//
-// This is also where the band lock bites, and deliberately the only place:
-// load() does not enforce it, so a board can always boot on whatever it
-// already holds. The lock stops a device being *moved* out of its band, it
-// never stops one from starting up. A band violation reports as
-// RF_CHANGE_REJECTED_RANGE rather than gaining its own reason code --
-// P_Ack's reason space lives in racelink_proto.h, which is drift-tested
-// across repositories, and "the frequency is not one this board accepts"
-// is what RANGE already means.
 inline RaceLinkProto::RfChangeReason store(const RaceLinkProto::P_RfConfig& c) {
   auto r = validate(c);
   if (r != RaceLinkProto::RF_CHANGE_OK) return r;
-  if (!bandAllows(c.freq_hz)) return RaceLinkProto::RF_CHANGE_REJECTED_RANGE;
   Preferences prefs;
   if (!prefs.begin(NVS_NAMESPACE, /*readOnly=*/false)) {
     return RaceLinkProto::RF_CHANGE_NVS_FAIL;
@@ -285,11 +227,6 @@ inline bool loadIdentity(uint8_t& regionIndex, uint8_t& channelId) {
 // Wipe the persisted RF config slot (used by boot-loop recovery and by
 // the "factory reset" path the host can trigger). Also resets the boot
 // counter so the next boot starts fresh. The next load() returns false.
-//
-// KEY_BAND is deliberately NOT removed. The band is a property of the
-// hardware in front of you, not of the configuration on it: boot-loop
-// recovery is meant to drop a bad channel, not to un-teach the board which
-// module it was built with. Only a re-flash changes it.
 inline void wipe() {
   Preferences prefs;
   if (!prefs.begin(NVS_NAMESPACE, /*readOnly=*/false)) return;
