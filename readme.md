@@ -49,7 +49,7 @@ Compile-time defines (shared by both environments):
 * `DEV_TYPE_STR="RaceLink_Gateway_v4"`
 
 For the full pin-mapping table and customisation guide, see the
-[Gateway firmware page](https://psi86.github.io/RaceLink_Docs/RaceLink_Gateway/).
+[Gateway firmware page](https://docs.racelink.dev/RaceLink_Gateway/).
 
 ## Radio defaults
 
@@ -69,7 +69,7 @@ the EU 868 MHz ISM band must adjust the frequency in
 
 Frames on the USB CDC link follow `[0x00][LEN][TYPE][DATA…]`. The
 authoritative wire-protocol reference is at
-[Wire protocol](https://psi86.github.io/RaceLink_Docs/reference/wire-protocol/);
+[Wire protocol](https://docs.racelink.dev/reference/wire-protocol/);
 the Gateway and WLED firmware mirror `racelink_proto.h`
 byte-identically (verified by `tests/test_proto_header_drift.py`
 in the Host repo).
